@@ -1,0 +1,7 @@
+.idea/*
+.idea
+
+.env.local
+.env
+
+pdf-microservice.iml
