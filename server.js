@@ -1,20 +1,66 @@
 import express from "express";
 import multer from "multer";
-import { PDFDocument, rgb } from "pdf-lib";
+import {PDFDocument, rgb} from "pdf-lib";
 import pkg from "pdfjs-dist/legacy/build/pdf.js";
-const { getDocument } = pkg;
+
+const {getDocument} = pkg;
+import fs from "fs";
+import path from "path";
+import os from "os";
+import {exec} from 'child_process';
+import * as util from 'util';
 
 const upload = multer();
 const app = express();
 
+// Convert exec to return a Promise
+const execPromise = (command, args) => {
+    return new Promise((resolve, reject) => {
+        // Combine command and arguments safely
+        const cmd = `${command} ${args.map(arg => `"${arg}"`).join(' ')}`;
+
+        exec(cmd, (error, stdout, stderr) => {
+            if (error) {
+                // Include stderr in the error for better debugging
+                error.message = `${error.message}\nstderr: ${stderr}`;
+                return reject(error);
+            }
+
+            // Resolve with both stdout and stderr
+            resolve({stdout, stderr});
+        });
+    });
+};
+
+async function convertPdfToPng(inFile, tmpDir) {
+    try {
+        const result = await execPromise("pdftoppm", [
+            "-png",    // Convert to PNG format
+            "-r",      // Resolution flag
+            "200",     // DPI resolution
+            inFile,    // Input PDF file
+            path.join(tmpDir, "page")  // Output path prefix
+        ]);
+
+        console.log('Conversion successful:', result.stdout);
+        return result;
+    } catch (error) {
+        console.error('Error during PDF conversion:', error.message);
+        throw error;
+    }
+}
+
 /** blacklist (lowercase) to avoid false positives */
 const NON_PII_TERMS = [
-    "cont curent","data detalii","debit credit balanta","cod fiscal platitor",
-    "referinta","iban","swift","sold initial","sold final","tranzactie",
-    "plata","transfer","descriere","balanta","moneda","data","account",
-    "current account","transaction","credit","debit","balance","statement",
-    "reference","payment","transfer","currency","details","iban number",
-    "swift code","bank branch","bank name"
+    "cont curent", "data detalii", "debit credit balanta", "cod fiscal platitor",
+    "referinta", "iban", "swift", "sold initial", "sold final", "tranzactie",
+    "plata", "transfer", "descriere", "balanta", "moneda", "data", "account",
+    "current account", "transaction", "credit", "debit", "balance", "statement",
+    "reference", "payment", "transfer", "currency", "details", "iban number",
+    "swift code", "bank branch", "bank name", "realimentare", "alimentare",
+    "cumparare", "home bank", "bank", "banca", "sucursala", "filiala",
+    "nr. crt.", "nr.crt.", "nume", "prenume", "adresa", "telefon", "email",
+    "tranzactie", "ing"
 ];
 
 /** regexes (conservative) */
@@ -39,18 +85,19 @@ function collectPIIMatches(lineText) {
             if (!txt) continue;
             const lower = txt.toLowerCase();
             if (NON_PII_TERMS.some(t => lower.includes(t))) continue;
-            matches.push({ type, text: txt, start: m.index, end: m.index + txt.length });
+            matches.push({type, text: txt, start: m.index, end: m.index + txt.length});
             if (m.index === re.lastIndex) re.lastIndex++;
         }
     }
-    matches.sort((a,b) => a.start - b.start || b.end - a.end);
+    matches.sort((a, b) => a.start - b.start || b.end - a.end);
     return matches;
 }
 
 async function safeGetDocument(opts) {
     const origWarn = console.warn;
     try {
-        console.warn = () => {};
+        console.warn = () => {
+        };
         return await getDocument(opts).promise;
     } finally {
         console.warn = origWarn;
@@ -59,9 +106,9 @@ async function safeGetDocument(opts) {
 
 function groupItemsIntoLines(itemsOrig) {
     const items = itemsOrig.map(it => {
-        const t = it.transform || [1,0,0,1,0,0];
-        return { ...it, x: t[4], y: t[5], transform: t };
-    }).sort((A,B) => {
+        const t = it.transform || [1, 0, 0, 1, 0, 0];
+        return {...it, x: t[4], y: t[5], transform: t};
+    }).sort((A, B) => {
         const dy = B.y - A.y;
         if (Math.abs(dy) > 3) return dy;
         return (A.x || 0) - (B.x || 0);
@@ -74,13 +121,16 @@ function groupItemsIntoLines(itemsOrig) {
         if (lastY === null || Math.abs(it.y - lastY) <= 3) {
             current.push(it);
         } else {
-            current.sort((a,b) => (a.x||0)-(b.x||0));
+            current.sort((a, b) => (a.x || 0) - (b.x || 0));
             lines.push(current);
             current = [it];
         }
         lastY = it.y;
     }
-    if (current.length) { current.sort((a,b) => (a.x||0)-(b.x||0)); lines.push(current); }
+    if (current.length) {
+        current.sort((a, b) => (a.x || 0) - (b.x || 0));
+        lines.push(current);
+    }
 
     const result = lines.map(lineItems => {
         const mapping = [];
@@ -88,7 +138,7 @@ function groupItemsIntoLines(itemsOrig) {
         for (let i = 0; i < lineItems.length; i++) {
             const it = lineItems[i];
             const str = it.str || "";
-            const t = it.transform || [1,0,0,1,0,0];
+            const t = it.transform || [1, 0, 0, 1, 0, 0];
             const width = (typeof it.width === "number" && it.width > 0) ? it.width : Math.max(1, str.length * 6);
             const charWidth = width / Math.max(1, str.length);
             const d = Math.abs(t[3]) || Math.abs(t[0]) || 10;
@@ -99,10 +149,23 @@ function groupItemsIntoLines(itemsOrig) {
             cursor += str.length;
             const hasTrailingSpace = /\s$/.test(str);
             let insertedSpace = false;
-            if (!hasTrailingSpace && i < lineItems.length - 1) { cursor += 1; insertedSpace = true; }
+            if (!hasTrailingSpace && i < lineItems.length - 1) {
+                cursor += 1;
+                insertedSpace = true;
+            }
             const end = cursor;
             mapping.push({
-                str, x: t[4], yBaseline: t[5], width, charWidth, fontHeight, ascent, descent, textStart: start, textEnd: end, insertedSpace
+                str,
+                x: t[4],
+                yBaseline: t[5],
+                width,
+                charWidth,
+                fontHeight,
+                ascent,
+                descent,
+                textStart: start,
+                textEnd: end,
+                insertedSpace
             });
         }
         const pieces = [];
@@ -110,7 +173,7 @@ function groupItemsIntoLines(itemsOrig) {
             pieces.push(mapping[i].str);
             if (mapping[i].insertedSpace && i < mapping.length - 1) pieces.push(" ");
         }
-        return { text: pieces.join(""), mapping };
+        return {text: pieces.join(""), mapping};
     });
 
     return result;
@@ -175,6 +238,34 @@ function bboxFromMapping(matchStart, matchEnd, mapping) {
     };
 }
 
+async function pdfToImagePdf(pdfBytes) {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pdfimg-"));
+    const inFile = path.join(tmpDir, "input.pdf");
+    fs.writeFileSync(inFile, pdfBytes);
+
+    // Convert to PNGs at 200 DPI
+    await execPromise("pdftoppm", ["-png", "-r", "200", inFile, path.join(tmpDir, "page")]);
+
+// Collect page images
+    const images = fs.readdirSync(tmpDir)
+        .filter(f => f.startsWith("page-") && f.endsWith(".png"))
+        .map(f => path.join(tmpDir, f))
+        .sort();
+
+    const pdfDoc = await PDFDocument.create();
+    for (const imgPath of images) {
+        const imgBytes = fs.readFileSync(imgPath);
+        const img = await pdfDoc.embedPng(imgBytes);
+        const page = pdfDoc.addPage([img.width, img.height]);
+        page.drawImage(img, {x: 0, y: 0, width: img.width, height: img.height});
+    }
+
+    const out = await pdfDoc.save();
+    fs.rmSync(tmpDir, {recursive: true, force: true});
+    return out;
+}
+
+
 app.post("/redact", upload.single("file"), async (req, res) => {
     try {
         if (!req.file) return res.status(400).send("PDF lipsă.");
@@ -183,13 +274,13 @@ app.post("/redact", upload.single("file"), async (req, res) => {
         const pdfBytes = req.file.buffer;
         const data = new Uint8Array(pdfBytes);
 
-        const pdfjsDoc = await safeGetDocument({ data });
+        const pdfjsDoc = await safeGetDocument({data});
         const pdfDoc = await PDFDocument.load(pdfBytes);
 
         for (let p = 0; p < pdfjsDoc.numPages; p++) {
             const pageNum = p + 1;
             const pdfjsPage = await pdfjsDoc.getPage(pageNum);
-            const textContent = await pdfjsPage.getTextContent({ disableCombineTextItems: false });
+            const textContent = await pdfjsPage.getTextContent({disableCombineTextItems: false});
             const pdfLibPage = pdfDoc.getPage(p);
 
             const itemsOrig = (textContent && textContent.items) || [];
@@ -207,13 +298,13 @@ app.post("/redact", upload.single("file"), async (req, res) => {
                 // Merge overlapping matches
                 const merged = [];
                 for (const m of matches) {
-                    if (!merged.length) merged.push({ ...m });
+                    if (!merged.length) merged.push({...m});
                     else {
                         const last = merged[merged.length - 1];
                         if (m.start <= last.end) {
                             last.end = Math.max(last.end, m.end);
                             last.text = lineText.slice(last.start, last.end);
-                        } else merged.push({ ...m });
+                        } else merged.push({...m});
                     }
                 }
 
@@ -245,7 +336,7 @@ app.post("/redact", upload.single("file"), async (req, res) => {
 
                             // End current word
                             if (i > currentStart) {
-                                subSpans.push({ start: currentStart, end: i });
+                                subSpans.push({start: currentStart, end: i});
                             }
                             inWord = false;
 
@@ -258,7 +349,7 @@ app.post("/redact", upload.single("file"), async (req, res) => {
 
                     // If no splits found, use the whole span
                     if (subSpans.length === 0) {
-                        subSpans.push({ start: span.start, end: span.end });
+                        subSpans.push({start: span.start, end: span.end});
                     }
 
                     // Draw rectangle for each sub-span
@@ -271,9 +362,20 @@ app.post("/redact", upload.single("file"), async (req, res) => {
 
                         // Enhanced horizontal padding to ensure first/last characters are fully covered
                         // Increase left padding more to cover first character
-                        const padXLeft = Math.max(2.5, box.width * 0.03);
-                        const padXRight = Math.max(2, box.width * 0.025);
-                        const padY = 0.5;
+                        console.log('--------------------Box.width----------------', box.width);
+                        let padXLeft;
+                        let padXRight;
+                        let padY;
+                        if (box.width < 30) {
+                            padXLeft = Math.max(2.5, box.width * 0.35);
+                            padXRight = Math.max(2, box.width * 0.035);
+                            padY = 0.5;
+                        } else {
+                            padXLeft = Math.max(2.5, box.width * 0.09);
+                            padXRight = Math.max(2, box.width * 0.035);
+                            padY = 0.5;
+                        }
+
 
                         pdfLibPage.drawRectangle({
                             x: box.x - padXLeft,
@@ -291,8 +393,10 @@ app.post("/redact", upload.single("file"), async (req, res) => {
         }
 
         const outBytes = await pdfDoc.save();
+        const imagePdfBytes = await pdfToImagePdf(outBytes);
+
         res.contentType("application/pdf");
-        res.send(Buffer.from(outBytes));
+        res.send(Buffer.from(imagePdfBytes));
     } catch (err) {
         console.error("❌ Error:", err);
         res.status(500).send("Eroare la procesarea PDF-ului: " + (err && err.message ? err.message : String(err)));
