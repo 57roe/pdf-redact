@@ -12,6 +12,7 @@ import * as util from 'util';
 
 const upload = multer();
 const app = express();
+import { verifyAuth } from "./authMiddleware.js";
 
 // Convert exec to return a Promise
 const execPromise = (command, args) => {
@@ -266,9 +267,9 @@ async function pdfToImagePdf(pdfBytes) {
 }
 
 
-app.post("/redact", upload.single("file"), async (req, res) => {
+app.post("/redact", verifyAuth, upload.single("file"), async (req, res) => {    
     try {
-        if (!req.file) return res.status(400).send("PDF lipsă.");
+        if (!req.file) return res.status(400).send("No pdf found in the request.");
 
         const debug = Boolean(req.query && req.query.debug && req.query.debug !== "0");
         const pdfBytes = req.file.buffer;
@@ -362,7 +363,6 @@ app.post("/redact", upload.single("file"), async (req, res) => {
 
                         // Enhanced horizontal padding to ensure first/last characters are fully covered
                         // Increase left padding more to cover first character
-                        console.log('--------------------Box.width----------------', box.width);
                         let padXLeft;
                         let padXRight;
                         let padY;
@@ -385,12 +385,12 @@ app.post("/redact", upload.single("file"), async (req, res) => {
                             color: debug ? rgb(1, 0, 0) : rgb(0, 0, 0),
                             opacity: debug ? 0.45 : 1.0,
                         });
-
-                        console.log(`🛡️ Page ${pageNum} redacted "${subText}" (${span.type})`);
                     }
                 }
             }
         }
+
+        console.log(`🛡️ Content redacted `);
 
         const outBytes = await pdfDoc.save();
         const imagePdfBytes = await pdfToImagePdf(outBytes);
@@ -399,8 +399,9 @@ app.post("/redact", upload.single("file"), async (req, res) => {
         res.send(Buffer.from(imagePdfBytes));
     } catch (err) {
         console.error("❌ Error:", err);
-        res.status(500).send("Eroare la procesarea PDF-ului: " + (err && err.message ? err.message : String(err)));
+        res.status(500).send("Error processing PDF: " + (err && err.message ? err.message : String(err)));
     }
 });
 
-app.listen(4000, () => console.log("🚀 PDF Redaction service running on port 4000"));
+const port = process.env.PORT || 4000;
+app.listen(port, () => console.log(`🚀 PDF Redaction service running on port ${port}`));
