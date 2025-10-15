@@ -14,10 +14,7 @@ const NON_PII_TERMS = [
     "plata","transfer","descriere","balanta","moneda","data","account",
     "current account","transaction","credit","debit","balance","statement",
     "reference","payment","transfer","currency","details","iban number",
-    "swift code","bank branch","bank name", "realimentare", "alimentare",
-    "cumparare", "home bank", "bank", "banca", "sucursala", "filiala",
-    "nr. crt.", "nr.crt.", "nume", "prenume", "adresa", "telefon", "email",
-    "tranzactie", "ing"
+    "swift code","bank branch","bank name"
 ];
 
 /** regexes (conservative) */
@@ -189,9 +186,6 @@ app.post("/redact", upload.single("file"), async (req, res) => {
         const pdfjsDoc = await safeGetDocument({ data });
         const pdfDoc = await PDFDocument.load(pdfBytes);
 
-        // Track text positions to redact for content stream manipulation
-        const redactionsByPage = new Map();
-
         for (let p = 0; p < pdfjsDoc.numPages; p++) {
             const pageNum = p + 1;
             const pdfjsPage = await pdfjsDoc.getPage(pageNum);
@@ -202,7 +196,6 @@ app.post("/redact", upload.single("file"), async (req, res) => {
             if (!itemsOrig.length) continue;
 
             const lines = groupItemsIntoLines(itemsOrig);
-            const pageRedactions = [];
 
             for (const ln of lines) {
                 const lineText = (ln.text || "").trim();
@@ -283,34 +276,18 @@ app.post("/redact", upload.single("file"), async (req, res) => {
                         const padY = 0.5;
 
                         pdfLibPage.drawRectangle({
-                            x: box.x - 2.5  * padXLeft, //2 ori
+                            x: box.x - padXLeft,
                             y: box.y - padY,
-                            width: box.width +  3 * (padXLeft + padXRight),//2 ori
-                            height: box.height + (2 * padY), //2 ori
+                            width: box.width + padXLeft + padXRight,
+                            height: box.height + (2 * padY),
                             color: debug ? rgb(1, 0, 0) : rgb(0, 0, 0),
                             opacity: debug ? 0.45 : 1.0,
-                        });
-
-                        // Store redaction info for content stream manipulation
-                        pageRedactions.push({
-                            box,
-                            text: subText
                         });
 
                         console.log(`🛡️ Page ${pageNum} redacted "${subText}" (${span.type})`);
                     }
                 }
             }
-
-            if (pageRedactions.length > 0) {
-                redactionsByPage.set(p, pageRedactions);
-            }
-        }
-
-        // Remove text from content streams
-        for (const [pageIndex, redactions] of redactionsByPage.entries()) {
-            const page = pdfDoc.getPage(pageIndex);
-            removeTextFromPage(page, redactions);
         }
 
         const outBytes = await pdfDoc.save();
