@@ -4,6 +4,7 @@ import {PDFDocument, rgb} from "pdf-lib";
 import pkg from "pdfjs-dist/legacy/build/pdf.js";
 
 const {getDocument} = pkg;
+// import fs as fsPromises from "fs/promises";
 import fs from "fs";
 import path from "path";
 import os from "os";
@@ -12,7 +13,12 @@ import * as util from 'util';
 
 const upload = multer();
 const app = express();
-import { verifyAuth } from "./authMiddleware.js";
+import {verifyAuth} from "./authMiddleware.js";
+import {createAdminClient, createSupabaseClient} from "./supabaseClients.js";
+
+import {GoogleGenAI} from "@google/genai";
+
+const googleAI = new GoogleGenAI({});
 
 // Convert exec to return a Promise
 const execPromise = (command, args) => {
@@ -372,137 +378,533 @@ async function pdfToImagePdf(pdfBytes) {
     return out;
 }
 
+function logWithMeta(label, meta) {
+    const detail = meta ? ` ${JSON.stringify(meta)}` : "";
+    console.log(`[StatementLog] ${label}${detail}`);
+}
 
-app.post("/redact", verifyAuth, upload.single("file"), async (req, res) => {    
+function logTiming(label, start, meta) {
+    const elapsed = Math.max(0, nowMs() - start);
+    const detail = meta ? ` ${JSON.stringify(meta)}` : "";
+    console.log(`[StatementTiming] ${label} ${elapsed}ms${detail}`);
+}
+
+function nowMs() {
+    return Date.now();
+}
+
+function deriveRedactedFilename(original) {
+    const trimmed = original.trim();
+    const dotIndex = trimmed.lastIndexOf(".");
+    const base = dotIndex >= 0 ? trimmed.slice(0, dotIndex) : trimmed;
+    const safeBase = base.replace(/[^a-zA-Z0-9._-]/g, "_") || "statement";
+    return `${safeBase}_redacted.pdf`;
+}
+
+async function uploadPdfToStorage(buffer, folder, originalName, supabaseAdmin) {
+    const bucket = process.env.SUPABASE_REDACTED_BUCKET ?? "bankstatement2csv";
+    const filename = deriveRedactedFilename(originalName);
+    const objectPath = `${folder}/${filename}`;
+
+    const upload = await supabaseAdmin.storage.from(bucket).upload(objectPath, buffer, {
+        cacheControl: "3600",
+        contentType: "application/pdf",
+        upsert: false,
+    });
+
+    if (upload.error) {
+        throw upload.error;
+    }
+
+    return {
+        path: objectPath,
+        filename,
+        size: buffer.byteLength,
+    };
+}
+
+function buildExtractionPrompt(batchLimit, cursor, thorough, history) {
+    const recentHistory = history.slice(-5);
+
+    let prompt = `Parse ALL transactions from the bank statement document pdf provided.
+Return ONLY a JSON object: { "transactions": [ { "date": "YYYY-MM-DD", "debit": number, "credit": number, "category": string, "title": string, "note": string, "amount": number } ] }
+
+Rules:
+- Return at most ${batchLimit} new transactions in chronological order.
+- Normalize date to YYYY-MM-DD; detect locale from context.
+- Interpret Amount/Value/Charge columns: if a single column represents net amount, return positive values as debits and negative values (or credit indicators) as credits.
+- If separate debit/credit columns exist, map them accordingly.
+- Recognize alternate headings (Amount, Value, Withdrawal, Deposit, DR/CR, +/-).
+- Convert comma/dot decimals correctly; do not lose decimals.
+- Treat blank fields as zero; never drop a transaction row even if data seems incomplete.
+- Title should summarize the payee/description.
+- Category should be one of: Food, Transport, Shopping, Bills, Income, Other (choose best guess).
+- Note can include original memo or additional context.
+- Do NOT omit rows; ignore headers/balances/totals.
+- If a row is ambiguous, still return best effort (never skip).
+- Only return an empty array if the statement truly contains zero transactions.
+- The array of transactions should be returned in the same order they appear in the pdf!`
+
+    if (cursor) {
+        prompt += `
+
+Continue immediately after this transaction (do NOT repeat it or earlier rows):
+${JSON.stringify(cursor)}
+
+If you cannot locate this entry, advance until you find it and then continue forward.`;
+    } else {
+        prompt += `
+
+Start from the earliest transaction in the statement.`;
+    }
+
+    if (recentHistory.length) {
+        const historyLines = recentHistory.map((entry) => `- ${JSON.stringify(entry)}`).join("\n");
+        prompt += `
+
+These transactions are already captured:
+${historyLines}
+Only output rows that appear after the last entry in this list.`;
+    }
+
+    if (thorough) {
+        prompt += `
+
+The previous output repeated earlier rows. Carefully scan forward to find new pages or later rows before replying.`;
+    }
+
+    return prompt;
+}
+
+async function extractTransactionsFromStatement(buffer, filename, mime) {
+    const BATCH_LIMIT = 150;
+    const cursor = null;
+    const history = [];
+    const duplicateRuns = 0;
+
+    const prompt = buildExtractionPrompt(BATCH_LIMIT, cursor, duplicateRuns > 0, history);
+
+    console.log("[Gemini 2.5 Flash] start request for file ", filename);
+    const contents = [
+        {text: prompt},
+        {
+            inlineData: {
+                mimeType: 'application/pdf',
+                data: Buffer.from(buffer).toString("base64")
+            }
+        }
+    ];
+
     try {
-        if (!req.file) return res.status(400).send("No pdf found in the request.");
+        const response = await googleAI.models.generateContent({
+            model: "gemini-2.5-flash",
+            contents: contents,
+        });
 
-        const debug = Boolean(req.query && req.query.debug && req.query.debug !== "0");
-        const pdfBytes = req.file.buffer;
-        const data = new Uint8Array(pdfBytes);
+        console.log("[Gemini 2.5 Flash] finished processing for file ", filename);
+        const transactionString = response.text?.replace('\`\`\`json', '')
+            .replace('\`\`\`', '');
 
-        const pdfjsDoc = await safeGetDocument({data});
-        const pdfDoc = await PDFDocument.load(pdfBytes);
+        return JSON.parse(transactionString)?.transactions;
+    } catch (err) {
+        console.error('[Gemini 2.5 Flash] failed ', err);
+        const response = await googleAI.models.generateContent({
+            model: "gemini-2.0-flash",
+            contents: contents,
+        });
 
-        for (let p = 0; p < pdfjsDoc.numPages; p++) {
-            const pageNum = p + 1;
-            const pdfjsPage = await pdfjsDoc.getPage(pageNum);
-            const textContent = await pdfjsPage.getTextContent({disableCombineTextItems: false});
-            const pdfLibPage = pdfDoc.getPage(p);
+        console.log("[Gemini 2.0 Flash] finished processing for file ", filename);
+        const transactionString = response.text?.replace('\`\`\`json', '')
+            .replace('\`\`\`', '');
 
-            const itemsOrig = (textContent && textContent.items) || [];
-            if (!itemsOrig.length) continue;
+        return JSON.parse(transactionString)?.transactions;
+    }
 
-            const lines = groupItemsIntoLines(itemsOrig);
+    return [];
+}
 
-            for (const ln of lines) {
-                const lineText = (ln.text || "").trim();
-                if (!lineText) continue;
+async function redactPdf(pdfjsDoc, pdfDoc, debug) {
+    for (let p = 0; p < pdfjsDoc.numPages; p++) {
+        const pageNum = p + 1;
+        const pdfjsPage = await pdfjsDoc.getPage(pageNum);
+        const textContent = await pdfjsPage.getTextContent({disableCombineTextItems: false});
+        const pdfLibPage = pdfDoc.getPage(p);
 
-                const matches = collectPIIMatches(lineText);
-                if (!matches.length) continue;
+        const itemsOrig = (textContent && textContent.items) || [];
+        if (!itemsOrig.length) continue;
 
-                // Merge overlapping matches
-                const merged = [];
-                for (const m of matches) {
-                    if (!merged.length) merged.push({...m});
-                    else {
-                        const last = merged[merged.length - 1];
-                        if (m.start <= last.end) {
-                            last.end = Math.max(last.end, m.end);
-                            last.text = lineText.slice(last.start, last.end);
-                        } else merged.push({...m});
+        const lines = groupItemsIntoLines(itemsOrig);
+
+        for (const ln of lines) {
+            const lineText = (ln.text || "").trim();
+            if (!lineText) continue;
+
+            const matches = collectPIIMatches(lineText);
+            if (!matches.length) continue;
+
+            // Merge overlapping matches
+            const merged = [];
+            for (const m of matches) {
+                if (!merged.length) merged.push({...m});
+                else {
+                    const last = merged[merged.length - 1];
+                    if (m.start <= last.end) {
+                        last.end = Math.max(last.end, m.end);
+                        last.text = lineText.slice(last.start, last.end);
+                    } else merged.push({...m});
+                }
+            }
+
+            for (const span of merged) {
+                if (NON_PII_TERMS.some(t => span.text.toLowerCase().includes(t))) continue;
+
+                // Split span if it contains large whitespace gaps (multiple names on same line)
+                const spanText = lineText.slice(span.start, span.end);
+                const subSpans = [];
+
+                // Split by 2+ consecutive spaces or detect gaps in mapping
+                let currentStart = span.start;
+                let inWord = false;
+
+                for (let i = span.start; i <= span.end; i++) {
+                    const char = i < lineText.length ? lineText[i] : '';
+                    const isSpace = !char || /\s/.test(char);
+
+                    if (!isSpace && !inWord) {
+                        // Starting a new word
+                        currentStart = i;
+                        inWord = true;
+                    } else if ((isSpace || i === span.end) && inWord) {
+                        // Check if there's a significant gap (multiple spaces or end)
+                        let gapSize = 0;
+                        for (let j = i; j < lineText.length && j < span.end && /\s/.test(lineText[j]); j++) {
+                            gapSize++;
+                        }
+
+                        // End current word
+                        if (i > currentStart) {
+                            subSpans.push({start: currentStart, end: i});
+                        }
+                        inWord = false;
+
+                        // Skip significant gaps (3+ spaces suggests separate items)
+                        if (gapSize >= 3) {
+                            i += gapSize - 1;
+                        }
                     }
                 }
 
-                for (const span of merged) {
-                    if (NON_PII_TERMS.some(t => span.text.toLowerCase().includes(t))) continue;
+                // If no splits found, use the whole span
+                if (subSpans.length === 0) {
+                    subSpans.push({start: span.start, end: span.end});
+                }
 
-                    // Split span if it contains large whitespace gaps (multiple names on same line)
-                    const spanText = lineText.slice(span.start, span.end);
-                    const subSpans = [];
+                // Draw rectangle for each sub-span
+                for (const subSpan of subSpans) {
+                    const subText = lineText.slice(subSpan.start, subSpan.end).trim();
+                    if (!subText || subText.length < 2) continue;
 
-                    // Split by 2+ consecutive spaces or detect gaps in mapping
-                    let currentStart = span.start;
-                    let inWord = false;
+                    const box = bboxFromMapping(subSpan.start, subSpan.end, ln.mapping);
+                    if (!box) continue;
 
-                    for (let i = span.start; i <= span.end; i++) {
-                        const char = i < lineText.length ? lineText[i] : '';
-                        const isSpace = !char || /\s/.test(char);
-
-                        if (!isSpace && !inWord) {
-                            // Starting a new word
-                            currentStart = i;
-                            inWord = true;
-                        } else if ((isSpace || i === span.end) && inWord) {
-                            // Check if there's a significant gap (multiple spaces or end)
-                            let gapSize = 0;
-                            for (let j = i; j < lineText.length && j < span.end && /\s/.test(lineText[j]); j++) {
-                                gapSize++;
-                            }
-
-                            // End current word
-                            if (i > currentStart) {
-                                subSpans.push({start: currentStart, end: i});
-                            }
-                            inWord = false;
-
-                            // Skip significant gaps (3+ spaces suggests separate items)
-                            if (gapSize >= 3) {
-                                i += gapSize - 1;
-                            }
-                        }
+                    // Enhanced horizontal padding to ensure first/last characters are fully covered
+                    // Increase left padding more to cover first character
+                    let padXLeft;
+                    let padXRight;
+                    let padY;
+                    if (box.width < 30) {
+                        padXLeft = Math.max(2.5, box.width * 0.35);
+                        padXRight = Math.max(2, box.width * 0.035);
+                        padY = 0.5;
+                    } else {
+                        padXLeft = Math.max(2.5, box.width * 0.09);
+                        padXRight = Math.max(2, box.width * 0.035);
+                        padY = 0.5;
                     }
 
-                    // If no splits found, use the whole span
-                    if (subSpans.length === 0) {
-                        subSpans.push({start: span.start, end: span.end});
-                    }
 
-                    // Draw rectangle for each sub-span
-                    for (const subSpan of subSpans) {
-                        const subText = lineText.slice(subSpan.start, subSpan.end).trim();
-                        if (!subText || subText.length < 2) continue;
-
-                        const box = bboxFromMapping(subSpan.start, subSpan.end, ln.mapping);
-                        if (!box) continue;
-
-                        // Enhanced horizontal padding to ensure first/last characters are fully covered
-                        // Increase left padding more to cover first character
-                        let padXLeft;
-                        let padXRight;
-                        let padY;
-                        if (box.width < 30) {
-                            padXLeft = Math.max(2.5, box.width * 0.35);
-                            padXRight = Math.max(2, box.width * 0.035);
-                            padY = 0.5;
-                        } else {
-                            padXLeft = Math.max(2.5, box.width * 0.09);
-                            padXRight = Math.max(2, box.width * 0.035);
-                            padY = 0.5;
-                        }
-
-
-                        pdfLibPage.drawRectangle({
-                            x: box.x - padXLeft,
-                            y: box.y - padY,
-                            width: box.width + padXLeft + padXRight,
-                            height: box.height + (2 * padY),
-                            color: debug ? rgb(1, 0, 0) : rgb(0, 0, 0),
-                            opacity: debug ? 0.45 : 1.0,
-                        });
-                    }
+                    pdfLibPage.drawRectangle({
+                        x: box.x - padXLeft,
+                        y: box.y - padY,
+                        width: box.width + padXLeft + padXRight,
+                        height: box.height + (2 * padY),
+                        color: debug ? rgb(1, 0, 0) : rgb(0, 0, 0),
+                        opacity: debug ? 0.45 : 1.0,
+                    });
                 }
             }
         }
+    }
 
-        console.log(`🛡️ Content redacted `);
+}
 
-        const outBytes = await pdfDoc.save();
-        const imagePdfBytes = await pdfToImagePdf(outBytes);
+function normalizeTransactions(input) {
+    return (Array.isArray(input) ? input : []).map((t) => {
+        const date = (t?.date ?? "").toString();
+        const category = (t?.category ?? "Other").toString();
+        const note = (t?.note ?? "").toString();
+        let debit = Number(t?.debit ?? 0);
+        let credit = Number(t?.credit ?? 0);
+        let amount = Number(t?.amount ?? 0);
 
-        res.contentType("application/pdf");
-        res.send(Buffer.from(imagePdfBytes));
+
+        if (!isFinite(debit)) debit = 0;
+        if (!isFinite(credit)) credit = 0;
+        if (!isFinite(amount)) amount = 0;
+
+
+        if (!debit && !credit) {
+            let amountNum = Number(
+                typeof t?.amount === "string"
+                    ? t.amount.replace(/\s/g, "").replace(",", ".")
+                    : t?.amount
+            );
+            if (!isFinite(amountNum)) amountNum = 0;
+            const isIncome = amountNum < 0;
+            if (isIncome) credit = Math.abs(amountNum);
+            else debit = Math.abs(amountNum);
+            amount = amountNum;
+        }
+
+
+        const title = (t?.title ?? "").toString();
+        return {date, title, debit, credit, amount, category, note};
+    });
+}
+
+function toCsv(transactions) {
+    const header = ["date", "title", "debit", "credit", "category", "note"].join(",");
+    const escape = (value) => {
+        const str = value == null ? "" : String(value);
+        const needsQuotes = str.includes(",") || str.includes("\n") || str.includes('"');
+        const escaped = str.replace(/"/g, '""');
+        return needsQuotes ? `"${escaped}"` : escaped;
+    };
+    const rows = transactions.map((t) =>
+        [
+            escape(t.date),
+            escape(t.title),
+            t.debit,
+            t.credit,
+            escape(t.category),
+            escape(t.note),
+        ].join(",")
+    );
+    return [header, ...rows].join("\n");
+}
+
+function deriveCsvName(original) {
+    const base = original.replace(/\.[^/.]+$/, "");
+    const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+    return `${base || "statement"}-${stamp}.csv`;
+}
+
+async function markJobReady(
+    supabase,
+    jobId,
+    generatedFileId
+) {
+    const {error} = await supabase
+        .from("statement_jobs")
+        .update({
+            status: "ready",
+            generated_file_id: generatedFileId,
+            completed_at: new Date().toISOString(),
+            updated_at: new Date().toISOString(),
+            error: null,
+        })
+        .eq("id", jobId);
+
+    if (error) {
+        throw error;
+    }
+}
+
+async function markJobErrored(supabase, jobId, message) {
+    await supabase
+        .from("statement_jobs")
+        .update({
+            status: "error",
+            error: message,
+            updated_at: new Date().toISOString(),
+        })
+        .eq("id", jobId);
+}
+
+async function insertStatementJob(supabase, userId, file) {
+    const {data, error} = await supabase
+        .from("statement_jobs")
+        .insert({
+            user_id: userId,
+            original_filename: file.name,
+            format: file.format,
+            status: "processing",
+            credits_estimated: file.credits,
+        })
+        .select("*")
+        .single();
+
+    if (error || !data) {
+        throw error ?? new Error("Failed to create job record");
+    }
+
+    return data;
+}
+
+async function countPdfPages(buffer) {
+    try {
+        const pdfDoc = await PDFDocument.load(buffer, {ignoreEncryption: true});
+        const pages = pdfDoc.getPageCount();
+        return pages > 0 ? pages : 1;
+    } catch {
+        return 1;
+    }
+}
+
+app.post("/process", verifyAuth, upload.array("files"), async (req, res) => {
+    try {
+        if (!req.files || !req.files.length) {
+            return res.status(400).send("No files found in the request.");
+        }
+
+        const adminSupabase = createAdminClient();
+        const supabase = await createSupabaseClient(req, res);
+        const {
+            data: {user},
+            error,
+        } = await supabase.auth.getUser();
+
+        if (error) throw error;
+
+        const downloadPayload = [];
+        const encodings = await Promise.all(
+            req.files.map(async (file) => {
+                const buffer = file.buffer;
+                const name = file?.originalname || "upload";
+                const mime = file?.mimetype || "application/octet-stream";
+                return {
+                    name,
+                    mime,
+                    credits:
+                        mime === "application/pdf" || /\.pdf$/i.test(name)
+                            ? await countPdfPages(buffer)
+                            : 1,
+                    buffer,
+                    isPdf: mime === "application/pdf" || /\.pdf$/i.test(name),
+                };
+            })
+        );
+
+        const jobRecords = [];
+        for (const file of encodings) {
+            const job = await insertStatementJob(adminSupabase, user.id, {
+                name: file.name,
+                credits: file.credits,
+                format: "csv",
+            });
+            jobRecords.push(job);
+        }
+
+        res.status(200).send(jobRecords);
+
+        for (let index = 0; index < encodings.length; index += 1) {
+            const file = encodings[index];
+            const job = jobRecords[index];
+            try {
+                logWithMeta("Processing file", {filename: file.name});
+                console.log(`Content redaction started for file ` + (file.name || "unknown"));
+
+                const debug = Boolean(req.query && req.query.debug && req.query.debug !== "0");
+                const pdfBytes = file.buffer;
+                const data = new Uint8Array(pdfBytes);
+                const pdfjsDoc = await safeGetDocument({data});
+                const pdfDoc = await PDFDocument.load(pdfBytes);
+
+                await redactPdf(pdfjsDoc, pdfDoc, debug);
+
+                console.log(`🛡️ Content redacted successfuly for file ` + (file.name || "unknown"));
+
+                const outBytes = await pdfDoc.save();
+                const redactedPdfBytes = await pdfToImagePdf(outBytes);
+
+                console.log(job)
+                const stored = await uploadPdfToStorage(redactedPdfBytes.buffer, `${user.id}/${job.id}`, file.name, adminSupabase);
+                logWithMeta("Stored redacted PDF in Supabase Storage Bucket", {filename: stored.filename, path: stored.path, size: stored.size});
+                const jobUpdate = await adminSupabase
+                    .from("statement_jobs")
+                    .update({
+                        redacted_pdf_path: stored.path,
+                        redacted_pdf_name: stored.filename,
+                        redacted_pdf_size: stored.size,
+                        updated_at: new Date().toISOString(),
+                    })
+                    .eq("id", job.id);
+
+                if (jobUpdate.error) {
+                    console.error("Failed to update job with redacted metadata", jobUpdate.error);
+                }
+
+                const extractionStart = nowMs();
+                const transactionsRaw = await extractTransactionsFromStatement(redactedPdfBytes.buffer, file.name, file.mime);
+                logTiming("extract.gemini", extractionStart, {
+                    filename: file.name,
+                    rows: transactionsRaw.length,
+                });
+                const transactions = normalizeTransactions(transactionsRaw);
+
+                const csv = toCsv(transactions);
+                const filename = deriveCsvName(file.name);
+
+                const {data: inserted, error} = await adminSupabase
+                    .from("generated_files")
+                    .insert({
+                        user_id: user.id,
+                        filename,
+                        size: Buffer.byteLength(csv, "utf-8"),
+                        content: csv,
+                        credits_used: file.credits,
+                        source_pdf_path: stored.path,
+                        source_pdf_filename: stored.filename,
+                        source_pdf_size: stored.size,
+                    })
+                    .select("id, filename")
+                    .single();
+
+                if (error || !inserted) {
+                    throw error ?? new Error("Failed to store generated file");
+                }
+
+                await markJobReady(adminSupabase, job.id, inserted.id);
+
+                downloadPayload.push({
+                    name: inserted.filename,
+                    url: `https://bankstatement2csv.com/api/generated-files/${inserted.id}`,
+                });
+            } catch (err) {
+                const message = err instanceof Error ? err.message : "Unknown error";
+                console.error("Async processing failed for", file.name, err);
+                await markJobErrored(adminSupabase, job.id, message);
+                logWithMeta("Processing failed", {filename: file.name, error: message});
+            }
+        }
+
+        if (downloadPayload.length) {
+            try {
+                // const html = renderProcessedEmail({
+                //     userName: user.email,
+                //     totalCredits,
+                //     downloadUrls: downloadPayload,
+                // });
+                // await sendEmail({
+                //     to: user.email,
+                //     subject: "Your BankStatement2CSV conversions are ready",
+                //     html,
+                // });
+                console.log('BankStatement2CSV conversions are ready for user', user.email);
+            } catch (err) {
+                console.error("Failed to send processing email", err);
+            }
+        }
     } catch (err) {
         console.error("❌ Error:", err);
         res.status(500).send("Error processing PDF: " + (err && err.message ? err.message : String(err)));
