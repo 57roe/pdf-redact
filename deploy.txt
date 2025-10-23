@@ -1,3 +1,0 @@
-gcloud builds submit --tag gcr.io/clarity-ai-473021/pdf-redact
-
-gcloud run deploy pdf-redact --image gcr.io/clarity-ai-473021/pdf-redact --platform managed --region us-central1 --allow-unauthenticated

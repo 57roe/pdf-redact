@@ -1,7 +1,10 @@
+import "./env.js";
+
 import express from "express";
 import multer from "multer";
 import {PDFDocument, rgb} from "pdf-lib";
 import pkg from "pdfjs-dist/legacy/build/pdf.js";
+import {v4 as uuidv4} from "uuid";
 
 const {getDocument} = pkg;
 // import fs as fsPromises from "fs/promises";
@@ -11,14 +14,45 @@ import os from "os";
 import {exec} from 'child_process';
 import * as util from 'util';
 
-const upload = multer();
-const app = express();
-import {verifyAuth} from "./authMiddleware.js";
+import {verifyAuth, getUserFromToken} from "./authMiddleware.js";
 import {createAdminClient, createSupabaseClient} from "./supabaseClients.js";
 
-import {GoogleGenAI} from "@google/genai";
+import {GoogleGenAI, createUserContent, createPartFromUri} from "@google/genai";
+import {CloudTasksClient} from "@google-cloud/tasks";
+import cors from "cors";
+
+import {createStorageClient} from "./googleStorageClient.js";
+
+const tasksClient = new CloudTasksClient();
+
+const upload = multer();
+const app = express();
+app.use(express.json({limit: "10mb"}));
+app.use(express.urlencoded({extended: true, limit: "10mb"}));
+app.use(verifyAuth);
+
 
 const googleAI = new GoogleGenAI({});
+PDFDocument.embedStandardFont = async function patchedEmbed(fontName) {
+    return PDFDocument.prototype.embedFont.call(this, fontName, {
+        custom: true,
+    });
+};
+
+// Provide a standard font data URL to silence Foxit font warnings.
+// const fontsDir = path.join(process.cwd(), "fonts", "standard");
+// if (fs.existsSync(fontsDir)) {
+//     globalThis.standardFontDataUrl = fontsDir;
+// }
+const storage = createStorageClient();
+const TEMP_BUCKET = 'pdf-temp-uploads';
+
+app.use(cors({
+    origin: ["https://bankstatement2csv.vercel.app", "https://bankstatement2csv.com", "https://www.bankstatement2csv.com"],
+    methods: ["GET", "POST", "PUT", "DELETE"],
+    // allowedHeaders: ["Content-Type", "Authorization"],
+    credentials: true
+}));
 
 // Convert exec to return a Promise
 const execPromise = (command, args) => {
@@ -49,7 +83,7 @@ async function convertPdfToPng(inFile, tmpDir) {
             path.join(tmpDir, "page")  // Output path prefix
         ]);
 
-        console.log('Conversion successful:', result.stdout);
+        console.log('Conversion successful:');
         return result;
     } catch (error) {
         console.error('Error during PDF conversion:', error.message);
@@ -401,8 +435,8 @@ function deriveRedactedFilename(original) {
     return `${safeBase}_redacted.pdf`;
 }
 
-async function uploadPdfToStorage(buffer, folder, originalName, supabaseAdmin) {
-    const bucket = process.env.SUPABASE_REDACTED_BUCKET ?? "bankstatement2csv";
+async function uploadPdfToSupabaseStorage(buffer, folder, originalName, supabaseAdmin) {
+    const bucket = "bankstatement2csv";
     const filename = deriveRedactedFilename(originalName);
     const objectPath = `${folder}/${filename}`;
 
@@ -477,50 +511,393 @@ The previous output repeated earlier rows. Carefully scan forward to find new pa
 }
 
 async function extractTransactionsFromStatement(buffer, filename, mime) {
-    const BATCH_LIMIT = 150;
+    const BATCH_LIMIT = 200;
     const cursor = null;
     const history = [];
     const duplicateRuns = 0;
 
-    const prompt = buildExtractionPrompt(BATCH_LIMIT, cursor, duplicateRuns > 0, history);
+    const basePrompt = buildExtractionPrompt(BATCH_LIMIT, cursor, duplicateRuns > 0, history);
 
-    console.log("[Gemini 2.5 Flash] start request for file ", filename);
-    const contents = [
-        {text: prompt},
-        {
-            inlineData: {
-                mimeType: 'application/pdf',
-                data: Buffer.from(buffer).toString("base64")
-            }
-        }
-    ];
+    const chunkingRules = `
+Output rules:
+1. Start each response with "CONTINUE ---" (if more transactions remain) or "END ---" (if this is the last batch).
+2. After the marker, output a JSON object: { "transactions": [ ... ] }
+3. Output up to ${BATCH_LIMIT} transactions per response.
+4. Do NOT wrap JSON in code fences.
+5. When asked to continue, repeat the last transaction as the first item, then continue with new ones.
+`;
 
-    try {
-        const response = await googleAI.models.generateContent({
-            model: "gemini-2.5-flash",
-            contents: contents,
-        });
+    console.log("[Gemini] Uploading file for", filename);
+    const fileDisplayName = filename || `statement-${Date.now()}.pdf`;
 
-        console.log("[Gemini 2.5 Flash] finished processing for file ", filename);
-        const transactionString = response.text?.replace('\`\`\`json', '')
-            .replace('\`\`\`', '');
-
-        return JSON.parse(transactionString)?.transactions;
-    } catch (err) {
-        console.error('[Gemini 2.5 Flash] failed ', err);
-        const response = await googleAI.models.generateContent({
-            model: "gemini-2.0-flash",
-            contents: contents,
-        });
-
-        console.log("[Gemini 2.0 Flash] finished processing for file ", filename);
-        const transactionString = response.text?.replace('\`\`\`json', '')
-            .replace('\`\`\`', '');
-
-        return JSON.parse(transactionString)?.transactions;
+    let payloadBuffer;
+    if (Buffer.isBuffer(buffer)) {
+        payloadBuffer = buffer;
+    } else if (typeof buffer === "string") {
+        payloadBuffer = Buffer.from(buffer, "base64");
+    } else if (buffer instanceof ArrayBuffer) {
+        payloadBuffer = Buffer.from(buffer);
+    } else if (ArrayBuffer.isView(buffer)) {
+        payloadBuffer = Buffer.from(buffer.buffer);
+    } else {
+        throw new Error("Unsupported buffer type");
     }
 
-    return [];
+    const payloadBlob = new Blob([payloadBuffer], {type: mime || "application/pdf"});
+    Object.defineProperty(payloadBlob, "size", { value: payloadBuffer.length });
+    console.log(`[Gemini] Uploading file: ${fileDisplayName} (${(payloadBuffer.length / 1024 / 1024).toFixed(2)} MB)`);
+
+    const upload = await googleAI.files.upload({
+        file: payloadBlob,
+        config: {
+            mimeType: mime || "application/pdf",
+            displayName: fileDisplayName,
+        }
+    });
+    const fileName = upload?.name;
+    const fileUri = upload?.uri;
+
+    if (!fileName || !fileUri) {
+        throw new Error("Failed to upload file to Gemini Files API");
+    }
+
+    console.log(`[Gemini] File uploaded successfully: ${fileName} (initial state: ${upload?.state || "UNKNOWN"})`);
+
+    // Wait for file to be processed before using it
+    console.log("[Gemini] Waiting for file to be processed...");
+    let fileState = upload?.state || "PROCESSING";
+    let attempts = 0;
+    const maxAttempts = 60; // 2 minutes max wait
+    
+    while (fileState === "PROCESSING" && attempts < maxAttempts) {
+        await new Promise(resolve => setTimeout(resolve, 2000)); // Wait 2 seconds
+        const fileInfo = await googleAI.files.get({ name: fileName });
+        fileState = fileInfo?.state || "ACTIVE";
+        attempts++;
+        
+        if (fileState === "ACTIVE") {
+            console.log(`[Gemini] File ready after ${attempts * 2} seconds`);
+            break;
+        } else if (fileState === "FAILED") {
+            throw new Error("File processing failed in Gemini API");
+        }
+    }
+    
+    if (fileState !== "ACTIVE") {
+        throw new Error(`File not ready after ${maxAttempts * 2} seconds (state: ${fileState})`);
+    }
+
+    const CONTINUE_MARKER = "CONTINUE ---";
+    const END_MARKER = "END ---";
+
+    const parseChunk = (rawText) => {
+        if (!rawText) return { transactions: [], hasEndMarker: false, hasContinueMarker: false, wasTruncated: false };
+
+        const trimmed = rawText.trim();
+        // STRICT marker detection - only at the very start of response
+        const hasEndMarker = trimmed.startsWith(END_MARKER);
+        const hasContinueMarker = trimmed.startsWith(CONTINUE_MARKER);
+
+        let remainder = trimmed;
+
+        if (hasContinueMarker) {
+            remainder = trimmed.slice(CONTINUE_MARKER.length).trim();
+        } else if (hasEndMarker) {
+            remainder = trimmed.slice(END_MARKER.length).trim();
+        }
+
+        remainder = remainder
+            .replace(/---\s*(CONTINUE|END)\s*---/gi, "")
+            .replace(/```json\s*/gi, "")
+            .replace(/```/g, "")
+            .replace(/JsonArray|JsonObject|JsonValue/gi, "")
+            .trim();
+
+        let candidateJson = remainder;
+        if (!candidateJson.startsWith("{")) {
+            const firstBrace = candidateJson.indexOf('{');
+            if (firstBrace >= 0) {
+                candidateJson = candidateJson.slice(firstBrace);
+            }
+        }
+
+        if (!candidateJson) {
+            return { transactions: [], hasEndMarker, hasContinueMarker, wasTruncated: false };
+        }
+
+        // First, try parsing as complete JSON
+        try {
+            const parsed = JSON.parse(candidateJson);
+            if (parsed?.error) {
+                console.warn("[Gemini] Chunk contains error payload", parsed.error);
+                return { transactions: [], hasEndMarker, hasContinueMarker, wasTruncated: false };
+            }
+            if (Array.isArray(parsed?.transactions)) {
+                return { 
+                    transactions: parsed.transactions, 
+                    hasEndMarker, 
+                    hasContinueMarker,
+                    wasTruncated: false
+                };
+            }
+            console.warn("[Gemini] Parsed JSON lacks transactions array", parsed);
+            return { transactions: [], hasEndMarker, hasContinueMarker, wasTruncated: false };
+        } catch (firstErr) {
+            // JSON parse failed - likely truncated response
+            console.warn("[Gemini] Initial JSON parse failed, extracting complete objects:", firstErr.message);
+            
+            // Find the transactions array start
+            const transArrayMatch = candidateJson.match(/"transactions"\s*:\s*\[/);
+            if (!transArrayMatch) {
+                console.error("[Gemini] Cannot find transactions array in chunk");
+                return { transactions: [], hasEndMarker, hasContinueMarker, wasTruncated: true };
+            }
+
+            const arrayStart = transArrayMatch.index + transArrayMatch[0].length;
+            const completeTransactions = [];
+            let depth = 0;
+            let inString = false;
+            let escapeNext = false;
+            let objStart = -1;
+
+            // Walk through the array and extract complete objects
+            for (let i = arrayStart; i < candidateJson.length; i++) {
+                const char = candidateJson[i];
+
+                if (escapeNext) {
+                    escapeNext = false;
+                    continue;
+                }
+                if (char === '\\') {
+                    escapeNext = true;
+                    continue;
+                }
+                if (char === '"') {
+                    inString = !inString;
+                    continue;
+                }
+                if (inString) continue;
+
+                if (char === '{') {
+                    if (depth === 0) objStart = i;
+                    depth++;
+                } else if (char === '}') {
+                    depth--;
+                    if (depth === 0 && objStart >= 0) {
+                        // Found a complete object
+                        const objText = candidateJson.slice(objStart, i + 1);
+                        try {
+                            const txn = JSON.parse(objText);
+                            completeTransactions.push(txn);
+                        } catch (objErr) {
+                            console.warn("[Gemini] Failed to parse individual transaction object:", objErr.message, objText.slice(0, 200));
+                        }
+                        objStart = -1;
+                    }
+                }
+            }
+
+            if (completeTransactions.length > 0) {
+                console.log(`[Gemini] Extracted ${completeTransactions.length} complete transactions from truncated chunk`);
+                return { 
+                    transactions: completeTransactions, 
+                    hasEndMarker: false, // Truncation means not ended
+                    hasContinueMarker: true, // Should continue
+                    wasTruncated: true 
+                };
+            } else {
+                console.error("[Gemini] No complete transactions extracted from chunk");
+                return { transactions: [], hasEndMarker, hasContinueMarker, wasTruncated: true };
+            }
+        }
+    };
+
+    const collectTransactionsFromModel = async (modelName) => {
+        const aggregated = [];
+        const seen = new Set();
+        let continueLoop = true;
+        let part = 1;
+        let lastCursor = null;
+
+        // Create base conversation contents
+        const initialUserParts = [
+            { text: `${basePrompt}\n\n${chunkingRules}` },
+            { fileData: { mimeType: mime || "application/pdf", fileUri } }
+        ];
+
+        // We'll reuse this base to rebuild conversation each iteration.
+        let conversationHistory = [
+            { role: "user", parts: initialUserParts }
+        ];
+
+        while (continueLoop && part <= 200) {
+            try {
+                // Add simple timeout to prevent infinite hangs
+                const timeoutMs = 3599000; // 59 minutes and 59 seconds
+                const responsePromise = googleAI.models.generateContent({
+                    model: modelName,
+                    contents: conversationHistory,
+                });
+                
+                const timeoutPromise = new Promise((_, reject) => 
+                    setTimeout(() => reject(new Error(`Timeout after ${timeoutMs/1000}s`)), timeoutMs)
+                );
+                
+                const response = await Promise.race([responsePromise, timeoutPromise]);
+
+                const candidate = response.candidates?.[0];
+                if (!candidate?.content) {
+                    console.warn(`[Gemini] [${modelName}] No candidate content in part ${part}`);
+                    break;
+                }
+
+                const responseText = candidate.content.parts
+                    ?.map((p) => p.text ?? "")
+                    .join("")
+                    .trim() || "";
+
+                console.log(`[Gemini] [${modelName}] received part ${part}`);
+
+                const { transactions: newTransactions, hasEndMarker, hasContinueMarker, wasTruncated } = parseChunk(responseText);
+                
+                console.log(`[Gemini] [${modelName}] parsed ${newTransactions.length} transactions (end=${hasEndMarker}, continue=${hasContinueMarker}, truncated=${wasTruncated})`);
+
+                // Deduplicate and add new transactions
+                let addedCount = 0;
+                for (const txn of newTransactions) {
+                    const key = JSON.stringify([
+                        txn.date ?? "",
+                        txn.title ?? "",
+                        txn.debit ?? 0,
+                        txn.credit ?? 0,
+                        txn.amount ?? 0,
+                        (txn.note ?? "").slice(0, 100),
+                    ]);
+                    if (!seen.has(key)) {
+                        seen.add(key);
+                        aggregated.push(txn);
+                        addedCount++;
+                    }
+                }
+
+                console.log(`[Gemini] [${modelName}] added ${addedCount} new transactions (total: ${aggregated.length})`);
+
+                if (newTransactions.length > 0) {
+                    lastCursor = newTransactions[newTransactions.length - 1];
+                }
+
+                // Append the model response to history
+                conversationHistory.push({ role: "model", parts: [{ text: responseText }] });
+
+                // Decide next action & update conversation history
+                if (hasEndMarker && !wasTruncated) {
+                    console.log(`[Gemini] [${modelName}] End marker, finishing with ${aggregated.length} total transactions`);
+                    continueLoop = false;
+                } else if (wasTruncated || hasContinueMarker || newTransactions.length > 0) {
+                    let continuePrompt = "";
+                    if (lastCursor) {
+                        continuePrompt = `The last transaction you provided was:\n${JSON.stringify(lastCursor)}\n\nNow continue with the NEXT transactions that come AFTER this one. Do NOT repeat this transaction or any earlier ones. Start with "CONTINUE ---".`;
+                    } else {
+                        continuePrompt = "CONTINUE ---";
+                    }
+
+                    conversationHistory.push({ role: "user", parts: [{ text: continuePrompt }] });
+                } else {
+                    console.warn(`[Gemini] [${modelName}] No progress, stopping with ${aggregated.length} transactions`);
+                    continueLoop = false;
+                }
+
+                part++;
+
+    } catch (err) {
+                console.error(`[Gemini] [${modelName}] Error in part ${part}:`, {
+                    message: err.message,
+                    name: err.name,
+                    cause: err.cause,
+                    stack: err.stack?.split('\n').slice(0, 3).join('\n'), // First 3 lines
+                    code: err.code,
+                    errno: err.errno,
+                    syscall: err.syscall
+                });
+                
+                // Check if it's a network error that might be transient
+                const isNetworkError = err.message?.includes('fetch failed') || 
+                                      err.message?.includes('ECONNRESET') ||
+                                      err.message?.includes('ETIMEDOUT') ||
+                                      err.code === 'ECONNRESET' ||
+                                      err.code === 'ETIMEDOUT';
+                
+                if (isNetworkError && part === 1) {
+                    // Retry first request once after network error
+                    console.log(`[Gemini] [${modelName}] Retrying part ${part} after network error...`);
+                    await new Promise(resolve => setTimeout(resolve, 5000)); // Wait 5s
+                    continue; // Don't increment part, try again
+                }
+                
+                break;
+            }
+        }
+
+        if (part > 200) {
+            console.warn(`[Gemini] [${modelName}] Reached maximum iterations with ${aggregated.length} transactions`);
+        }
+
+        return aggregated;
+    };
+
+    console.log("[Gemini] Uploaded file", {fileName, fileUri});
+    console.log("[Gemini] [gemini-2.5-flash] Initiating request for file ", {fileName, fileUri});
+    let transactions = [];
+    try {
+        transactions = await collectTransactionsFromModel("gemini-2.5-flash");
+    } catch (err) {
+        console.error('[Gemini] [gemini-2.5-flash] failed ', err);
+        console.log("[Gemini] [gemini-2.0-flash] Initiate request for file ", filename);
+        transactions = await collectTransactionsFromModel("gemini-2.0-flash");
+    } finally {
+        try {
+            await googleAI.files.delete({name: fileName});
+            console.log("[Gemini] Deleted uploaded file", fileName);
+        } catch (deleteErr) {
+            console.error("[Gemini] Failed to delete uploaded file", fileName, deleteErr);
+        }
+    }
+
+    return transactions || [];
+}
+
+function normalizeTransactions(input) {
+    return (Array.isArray(input) ? input : []).map((t) => {
+        const date = (t?.date ?? "").toString();
+        const category = (t?.category ?? "Other").toString();
+        const note = (t?.note ?? "").toString();
+        let debit = Number(t?.debit ?? 0);
+        let credit = Number(t?.credit ?? 0);
+        let amount = Number(t?.amount ?? 0);
+
+
+        if (!isFinite(debit)) debit = 0;
+        if (!isFinite(credit)) credit = 0;
+        if (!isFinite(amount)) amount = 0;
+
+
+        if (!debit && !credit) {
+            let amountNum = Number(
+                typeof t?.amount === "string"
+                    ? t.amount.replace(/\s/g, "").replace(",", ".")
+                    : t?.amount
+            );
+            if (!isFinite(amountNum)) amountNum = 0;
+            const isIncome = amountNum < 0;
+            if (isIncome) credit = Math.abs(amountNum);
+            else debit = Math.abs(amountNum);
+            amount = amountNum;
+        }
+
+
+        const title = (t?.title ?? "").toString();
+        return {date, title, debit, credit, amount, category, note};
+    });
 }
 
 async function redactPdf(pdfjsDoc, pdfDoc, debug) {
@@ -638,40 +1015,6 @@ async function redactPdf(pdfjsDoc, pdfDoc, debug) {
 
 }
 
-function normalizeTransactions(input) {
-    return (Array.isArray(input) ? input : []).map((t) => {
-        const date = (t?.date ?? "").toString();
-        const category = (t?.category ?? "Other").toString();
-        const note = (t?.note ?? "").toString();
-        let debit = Number(t?.debit ?? 0);
-        let credit = Number(t?.credit ?? 0);
-        let amount = Number(t?.amount ?? 0);
-
-
-        if (!isFinite(debit)) debit = 0;
-        if (!isFinite(credit)) credit = 0;
-        if (!isFinite(amount)) amount = 0;
-
-
-        if (!debit && !credit) {
-            let amountNum = Number(
-                typeof t?.amount === "string"
-                    ? t.amount.replace(/\s/g, "").replace(",", ".")
-                    : t?.amount
-            );
-            if (!isFinite(amountNum)) amountNum = 0;
-            const isIncome = amountNum < 0;
-            if (isIncome) credit = Math.abs(amountNum);
-            else debit = Math.abs(amountNum);
-            amount = amountNum;
-        }
-
-
-        const title = (t?.title ?? "").toString();
-        return {date, title, debit, credit, amount, category, note};
-    });
-}
-
 function toCsv(transactions) {
     const header = ["date", "title", "debit", "credit", "category", "note"].join(",");
     const escape = (value) => {
@@ -699,11 +1042,7 @@ function deriveCsvName(original) {
     return `${base || "statement"}-${stamp}.csv`;
 }
 
-async function markJobReady(
-    supabase,
-    jobId,
-    generatedFileId
-) {
+async function markJobReady(supabase, jobId, generatedFileId) {
     const {error} = await supabase
         .from("statement_jobs")
         .update({
@@ -761,6 +1100,186 @@ async function countPdfPages(buffer) {
     }
 }
 
+async function uploadToGCS(buffer, filename, mime) {
+    const id = uuidv4();
+    const safeName = filename.replace(/[^a-zA-Z0-9.\-_]/g, "_");
+    const objectName = `temp/${id}-${safeName}`;
+    const bucket = storage.bucket(TEMP_BUCKET);
+    const file = bucket.file(objectName);
+
+    let bucketExists = true;
+    try {
+        const [exists] = await bucket.exists();
+        bucketExists = Boolean(exists);
+    } catch (existsErr) {
+        console.error("[GCS upload] Bucket existence check failed", {
+            bucket: TEMP_BUCKET,
+            code: existsErr?.code,
+            message: existsErr?.message,
+        });
+        throw existsErr;
+    }
+
+    if (!bucketExists) {
+        throw new Error(`GCS bucket ${TEMP_BUCKET} does not exist or is inaccessible`);
+    }
+
+    const toBuffer = (input) => {
+        if (Buffer.isBuffer(input)) return input;
+        if (input instanceof Uint8Array) return Buffer.from(input);
+        if (ArrayBuffer.isView(input)) return Buffer.from(input.buffer);
+        if (input instanceof ArrayBuffer) return Buffer.from(input);
+        throw new TypeError("uploadToGCS received unsupported buffer type");
+    };
+
+    const payload = toBuffer(buffer);
+
+    try {
+        await file.save(payload, {
+        contentType: mime,
+        resumable: false,
+    });
+    } catch (err) {
+        console.error("[GCS upload] Failed", {
+            bucket: TEMP_BUCKET,
+            objectName,
+            mime,
+            byteLength: payload.byteLength,
+            code: err?.code,
+            message: err?.message,
+            errors: err?.errors,
+        });
+        throw err;
+    }
+
+    const [url] = await file.getSignedUrl({
+        action: "read",
+        expires: Date.now() + 1000 * 60 * 60, // 1 hour temporary URL
+    });
+
+    return {gcsPath: `gs://${TEMP_BUCKET}/${objectName}`, url};
+}
+
+
+async function process(encodings, jobRecords, user, adminSupabase) {
+    const downloadPayload = [];
+
+    for (let index = 0; index < encodings.length; index += 1) {
+        const file = encodings[index];
+        const job = jobRecords[index];
+        try {
+            logWithMeta("Processing file", {filename: file.name});
+            console.log(`Content redaction started for file ` + (file.name || "unknown"));
+
+            const debug = false;
+            const pdfBytes = file.buffer;
+            const data = new Uint8Array(pdfBytes);
+            const pdfjsDoc = await safeGetDocument({data});
+            const pdfDoc = await PDFDocument.load(pdfBytes, {ignoreEncryption: true}); // optional flag
+
+            await redactPdf(pdfjsDoc, pdfDoc, debug);
+
+            console.log(`🛡️ Content redacted successfuly for file ` + (file.name || "unknown"));
+
+            console.log(`PDF redaction started for file ` + (file.name || "unknown"));
+
+            const outBytes = await pdfDoc.save({
+                useObjectStreams: false,
+            });
+
+            let redactedPdfBytes;
+            try {
+                redactedPdfBytes = await pdfToImagePdf(outBytes);
+            } catch (conversionErr) {
+                console.error("[Redaction] Failed to rasterize PDF via pdftoppm, falling back to vector PDF", conversionErr);
+                redactedPdfBytes = outBytes;
+            }
+            console.log(`📄 PDF redacted successfuly for file ` + (file.name || "unknown"));
+
+            console.log(job)
+            const stored = await uploadPdfToSupabaseStorage(redactedPdfBytes.buffer ?? redactedPdfBytes, `${user.id}/${job.id}`, file.name, adminSupabase);
+            logWithMeta("Stored redacted PDF in Supabase Storage Bucket", {
+                filename: stored.filename,
+                path: stored.path,
+                size: stored.size
+            });
+            const jobUpdate = await adminSupabase
+                .from("statement_jobs")
+                .update({
+                    redacted_pdf_path: stored.path,
+                    redacted_pdf_name: stored.filename,
+                    redacted_pdf_size: stored.size,
+                    updated_at: new Date().toISOString(),
+                })
+                .eq("id", job.id);
+
+            if (jobUpdate.error) {
+                console.error("Failed to update job with redacted metadata", jobUpdate.error);
+            }
+
+            const extractionStart = nowMs();
+            const transactionsRaw = await extractTransactionsFromStatement(redactedPdfBytes.buffer, file.name, file.mime);
+            logTiming("extract.gemini", extractionStart, {
+                filename: file.name,
+                rows: transactionsRaw.length,
+            });
+            const transactions = normalizeTransactions(transactionsRaw);
+
+            const csv = toCsv(transactions);
+            const filename = deriveCsvName(file.name);
+
+            const {data: inserted, error} = await adminSupabase
+                .from("generated_files")
+                .insert({
+                    user_id: user.id,
+                    filename,
+                    size: Buffer.byteLength(csv, "utf-8"),
+                    content: csv,
+                    credits_used: file.credits,
+                    source_pdf_path: stored.path,
+                    source_pdf_filename: stored.filename,
+                    source_pdf_size: stored.size,
+                })
+                .select("id, filename")
+                .single();
+
+            if (error || !inserted) {
+                throw error ?? new Error("Failed to store generated file");
+            }
+
+            await markJobReady(adminSupabase, job.id, inserted.id);
+
+            downloadPayload.push({
+                name: inserted.filename,
+                url: `https://bankstatement2csv.com/api/generated-files/${inserted.id}`,
+            });
+        } catch (err) {
+            const message = err instanceof Error ? err.message : "Unknown error";
+            console.error("Async processing failed for", file.name, err);
+            await markJobErrored(adminSupabase, job.id, message);
+            logWithMeta("Processing failed", {filename: file.name, error: message});
+        }
+    }
+
+    if (downloadPayload.length) {
+        try {
+            // const html = renderProcessedEmail({
+            //     userName: user.email,
+            //     totalCredits,
+            //     downloadUrls: downloadPayload,
+            // });
+            // await sendEmail({
+            //     to: user.email,
+            //     subject: "Your BankStatement2CSV conversions are ready",
+            //     html,
+            // });
+            console.log('BankStatement2CSV conversions are ready for user', user.email);
+        } catch (err) {
+            console.error("Failed to send processing email", err);
+        }
+    }
+}
+
 app.post("/process", verifyAuth, upload.array("files"), async (req, res) => {
     try {
         if (!req.files || !req.files.length) {
@@ -776,140 +1295,217 @@ app.post("/process", verifyAuth, upload.array("files"), async (req, res) => {
 
         if (error) throw error;
 
-        const downloadPayload = [];
-        const encodings = await Promise.all(
-            req.files.map(async (file) => {
-                const buffer = file.buffer;
-                const name = file?.originalname || "upload";
-                const mime = file?.mimetype || "application/octet-stream";
-                return {
-                    name,
-                    mime,
-                    credits:
-                        mime === "application/pdf" || /\.pdf$/i.test(name)
-                            ? await countPdfPages(buffer)
-                            : 1,
-                    buffer,
-                    isPdf: mime === "application/pdf" || /\.pdf$/i.test(name),
-                };
-            })
-        );
+        const filesMeta = [];
+
+        for (const file of req.files) {
+            const buffer = file.buffer;
+            const name = file.originalname || "upload.pdf";
+            const mime = file.mimetype || "application/octet-stream";
+            const isPdf = mime === "application/pdf" || /\.pdf$/i.test(name);
+            const credits = isPdf ? await countPdfPages(buffer) : 1;
+            const {gcsPath, url} = await uploadToGCS(buffer, name, mime);
+
+            filesMeta.push({
+                name,
+                mime,
+                credits,
+                isPdf,
+                gcsPath,
+                url,
+            });
+        }
+
 
         const jobRecords = [];
-        for (const file of encodings) {
+        for (const f of filesMeta) {
+            console.log(`Creating job record for file ${f.name} (credits: ${f.credits})`);
             const job = await insertStatementJob(adminSupabase, user.id, {
-                name: file.name,
-                credits: file.credits,
+                name: f.name,
+                credits: f.credits,
                 format: "csv",
             });
             jobRecords.push(job);
         }
 
-        res.status(200).send(jobRecords);
+        // === Extract Bearer token from request ===
+        const authHeader = req.headers.authorization;
+        const bearerToken = authHeader?.startsWith("Bearer ") ? authHeader.split(" ")[1] : null;
 
-        for (let index = 0; index < encodings.length; index += 1) {
-            const file = encodings[index];
-            const job = jobRecords[index];
-            try {
-                logWithMeta("Processing file", {filename: file.name});
-                console.log(`Content redaction started for file ` + (file.name || "unknown"));
-
-                const debug = Boolean(req.query && req.query.debug && req.query.debug !== "0");
-                const pdfBytes = file.buffer;
-                const data = new Uint8Array(pdfBytes);
-                const pdfjsDoc = await safeGetDocument({data});
-                const pdfDoc = await PDFDocument.load(pdfBytes);
-
-                await redactPdf(pdfjsDoc, pdfDoc, debug);
-
-                console.log(`🛡️ Content redacted successfuly for file ` + (file.name || "unknown"));
-
-                const outBytes = await pdfDoc.save();
-                const redactedPdfBytes = await pdfToImagePdf(outBytes);
-
-                console.log(job)
-                const stored = await uploadPdfToStorage(redactedPdfBytes.buffer, `${user.id}/${job.id}`, file.name, adminSupabase);
-                logWithMeta("Stored redacted PDF in Supabase Storage Bucket", {filename: stored.filename, path: stored.path, size: stored.size});
-                const jobUpdate = await adminSupabase
-                    .from("statement_jobs")
-                    .update({
-                        redacted_pdf_path: stored.path,
-                        redacted_pdf_name: stored.filename,
-                        redacted_pdf_size: stored.size,
-                        updated_at: new Date().toISOString(),
-                    })
-                    .eq("id", job.id);
-
-                if (jobUpdate.error) {
-                    console.error("Failed to update job with redacted metadata", jobUpdate.error);
-                }
-
-                const extractionStart = nowMs();
-                const transactionsRaw = await extractTransactionsFromStatement(redactedPdfBytes.buffer, file.name, file.mime);
-                logTiming("extract.gemini", extractionStart, {
-                    filename: file.name,
-                    rows: transactionsRaw.length,
-                });
-                const transactions = normalizeTransactions(transactionsRaw);
-
-                const csv = toCsv(transactions);
-                const filename = deriveCsvName(file.name);
-
-                const {data: inserted, error} = await adminSupabase
-                    .from("generated_files")
-                    .insert({
-                        user_id: user.id,
-                        filename,
-                        size: Buffer.byteLength(csv, "utf-8"),
-                        content: csv,
-                        credits_used: file.credits,
-                        source_pdf_path: stored.path,
-                        source_pdf_filename: stored.filename,
-                        source_pdf_size: stored.size,
-                    })
-                    .select("id, filename")
-                    .single();
-
-                if (error || !inserted) {
-                    throw error ?? new Error("Failed to store generated file");
-                }
-
-                await markJobReady(adminSupabase, job.id, inserted.id);
-
-                downloadPayload.push({
-                    name: inserted.filename,
-                    url: `https://bankstatement2csv.com/api/generated-files/${inserted.id}`,
-                });
-            } catch (err) {
-                const message = err instanceof Error ? err.message : "Unknown error";
-                console.error("Async processing failed for", file.name, err);
-                await markJobErrored(adminSupabase, job.id, message);
-                logWithMeta("Processing failed", {filename: file.name, error: message});
-            }
+        if (!bearerToken) {
+            return res.status(401).json({error: "Missing authorization token"});
         }
 
-        if (downloadPayload.length) {
-            try {
-                // const html = renderProcessedEmail({
-                //     userName: user.email,
-                //     totalCredits,
-                //     downloadUrls: downloadPayload,
-                // });
-                // await sendEmail({
-                //     to: user.email,
-                //     subject: "Your BankStatement2CSV conversions are ready",
-                //     html,
-                // });
-                console.log('BankStatement2CSV conversions are ready for user', user.email);
-            } catch (err) {
-                console.error("Failed to send processing email", err);
-            }
-        }
+
+        console.log('-------BODY-------------\n', JSON.stringify({
+            jobRecords,
+            files: filesMeta.map(({name, mime, credits, gcsPath}) => ({name, mime, credits, gcsPath})),
+        }))
+
+
+        //for local, do not delete TODO refactor
+        // fetch("http://localhost:8080/tasks/run/async", {
+        //     method: "POST",
+        //         headers: {
+        //             "Content-Type": "application/json",
+        //             "Authorization": `Bearer ${bearerToken}`,
+        //         },
+        //     body: JSON.stringify({
+        //         jobRecords,
+        //         files: filesMeta.map(({name, mime, credits, gcsPath}) => ({name, mime, credits, gcsPath})),
+        //     }),
+        // }).then((resp) => {
+        //     if (!resp.ok) {
+        //         return resp.text().then((t) => console.error("Task dispatch failed:", resp.status, t));
+        //     } else {
+        //         res.json(resp.text());
+        //     }
+        //     console.log("Background task dispatched");
+        // }).catch((err) => {
+        //     console.error("Failed to dispatch background task:", err);
+        // });
+
+
+        const taskPayload = {
+            jobRecords,
+            files: filesMeta.map(({name, mime, credits, gcsPath}) => ({name, mime, credits, gcsPath}))
+        };
+
+        const queuePath = tasksClient.queuePath(
+            "bankstatement2csv",
+            "us-central1",
+            "pdf-jobs-queue"
+        );
+
+        const task = {
+            httpRequest: {
+                httpMethod: "POST",
+                url: `https://bankstatement2csv.uc.r.appspot.com/tasks/run/async`,
+                headers: {
+                    "Content-Type": "application/json",
+                    "Authorization": `Bearer ${bearerToken}`,
+                },
+                body: Buffer.from(JSON.stringify(taskPayload)).toString("base64"),
+            },
+            dispatchDeadline: { seconds: 1800 }, // 30 minutes (max),
+        };
+
+        await tasksClient.createTask({parent: queuePath, task});
+
+        // === Respond immediately ===
+        res.json(jobRecords);
     } catch (err) {
         console.error("❌ Error:", err);
-        res.status(500).send("Error processing PDF: " + (err && err.message ? err.message : String(err)));
+        if (!res.headersSent) {
+            res.status(500).send("Error processing PDF: " + (err && err.message ? err.message : String(err)));
+        }
     }
 });
 
-const port = process.env.PORT || 4000;
+app.post("/tasks/run/async", async (req, res) => {
+    try {
+        console.log("🚀 Received Cloud Task for PDF processing with following payload");
+
+        // === Extract user from Authorization header ===
+        const authHeader = req.headers.authorization;
+        const token = authHeader?.startsWith("Bearer ") ? authHeader.split(" ")[1] : null;
+
+        if (!token) {
+            console.error("❌ Missing authorization token in Cloud Task");
+            return res.status(401).json({error: "Missing authorization token"});
+        }
+
+        let user;
+        try {
+            user = await getUserFromToken(token);
+        } catch (err) {
+            console.error("❌ Invalid token in Cloud Task:", err.message);
+            return res.status(401).json({error: err.message});
+        }
+
+        const adminSupabase = createAdminClient();
+
+        const requestBody = Buffer.isBuffer(req.body) ? req.body : Buffer.from(JSON.stringify(req.body || {}));
+        const payload = JSON.parse(requestBody.toString());
+
+        const {jobRecords, files} = payload || {};
+
+        if (!Array.isArray(jobRecords) || !Array.isArray(files)) {
+            throw new Error("Task payload missing jobRecords/files");
+        }
+
+        console.log("🚀 Received Cloud Task for PDF processing with following payload:", {
+            jobRecordsCount: jobRecords.length,
+            filesCount: files.length,
+        });
+
+        // === Respond immediately with 200 OK ===
+        res.status(200).json({status: "Task accepted", taskId: jobRecords[0]?.id});
+
+        // === Process files in the background (don't await) ===
+        (async () => {
+            try {
+                console.log(`📥 Fetching ${files.length} files from GCS for user ${user.email}`);
+                const encodings = await Promise.all(
+                    files.map(async (file) => {
+                        try {
+                            const bucket = storage.bucket(TEMP_BUCKET);
+                            const objectPath = file.gcsPath.replace(`gs://${TEMP_BUCKET}/`, '');
+                            const gcsFile = bucket.file(objectPath);
+                            const [exists] = await gcsFile.exists();
+                            if (!exists) {
+                                throw new Error(`GCS object not found at gs://${TEMP_BUCKET}/${objectPath}`);
+                            }
+
+                            let buffer;
+                            try {
+                                [buffer] = await gcsFile.download();
+                            } catch (downloadErr) {
+                                console.error("[GCS download] Failed", {
+                                    bucket: TEMP_BUCKET,
+                                    objectPath,
+                                    code: downloadErr?.code,
+                                    message: downloadErr?.message,
+                                });
+                                throw downloadErr;
+                            }
+
+                            console.log(`✓ Downloaded ${file.name} (${buffer.length} bytes)`);
+                            
+                            return {
+                                name: file.name,
+                                mime: file.mime,
+                                credits: file.credits,
+                                buffer: buffer,
+                            };
+                        } catch (err) {
+                            console.error(`❌ Failed to download ${file.name} from GCS:`, err.message);
+                            throw err;
+                        }
+                    })
+                );
+
+                // === Process files ===
+                await process(encodings, jobRecords, user, adminSupabase);
+
+                console.log("✅ Background processing completed for user", user.email);
+            } catch (err) {
+                console.error("❌ Background task error for user", user.email, ":", err);
+                // Update jobs to error status
+                for (const job of jobRecords) {
+                    await markJobErrored(adminSupabase, job.id, err.message || "Background processing failed");
+                }
+            }
+        })();
+
+    } catch (err) {
+        console.error("❌ Task validation error:", err);
+        if (!res.headersSent) {
+            res.status(500).json({error: "Task failed: " + err.message});
+        }
+    }
+});
+
+app.get("/liveness_check", (req, res) => res.status(200).send("ok"));
+app.get("/readiness_check", (req, res) => res.status(200).send("ready"));
+const port = 8080;
 app.listen(port, () => console.log(`🚀 PDF Redaction service running on port ${port}`));

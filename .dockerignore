@@ -4,6 +4,15 @@ Dockerfile
 .dockerignore
 .git
 .gitignore
+
 .env
+.env.local
+.env.dev
+.env.prod
 .vscode
 .idea
+
+service-account.json
+app.yaml
+bankstatement2csv-9c71a0a0e4b8.json
+

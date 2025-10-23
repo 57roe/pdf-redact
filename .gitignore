@@ -2,6 +2,13 @@
 .idea
 
 .env.local
+.env.prod
 .env
 
 pdf-microservice.iml
+
+deploy.yaml
+
+app.yaml
+
+service-account.json
