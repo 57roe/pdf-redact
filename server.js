@@ -2,33 +2,33 @@ import "./env.js";
 
 import express from "express";
 import multer from "multer";
-import {PDFDocument, rgb} from "pdf-lib";
+import { PDFDocument, rgb } from "pdf-lib";
 import pkg from "pdfjs-dist/legacy/build/pdf.js";
-import {v4 as uuidv4} from "uuid";
+import { v4 as uuidv4 } from "uuid";
 
-const {getDocument} = pkg;
+const { getDocument } = pkg;
 // import fs as fsPromises from "fs/promises";
 import fs from "fs";
 import path from "path";
 import os from "os";
-import {exec} from 'child_process';
+import { exec } from 'child_process';
 import * as util from 'util';
 
-import {verifyAuth, getUserFromToken} from "./authMiddleware.js";
-import {createAdminClient, createSupabaseClient} from "./supabaseClients.js";
+import { verifyAuth, getUserFromToken } from "./authMiddleware.js";
+import { createAdminClient, createSupabaseClient } from "./supabaseClients.js";
 
-import {GoogleGenAI, createUserContent, createPartFromUri} from "@google/genai";
-import {CloudTasksClient} from "@google-cloud/tasks";
+import { GoogleGenAI, createUserContent, createPartFromUri } from "@google/genai";
+import { CloudTasksClient } from "@google-cloud/tasks";
 import cors from "cors";
 
-import {createStorageClient} from "./googleStorageClient.js";
+import { createStorageClient } from "./googleStorageClient.js";
 
 const tasksClient = new CloudTasksClient();
 
 const upload = multer();
 const app = express();
-app.use(express.json({limit: "10mb"}));
-app.use(express.urlencoded({extended: true, limit: "10mb"}));
+app.use(express.json({ limit: "10mb" }));
+app.use(express.urlencoded({ extended: true, limit: "10mb" }));
 app.use(verifyAuth);
 
 
@@ -68,7 +68,7 @@ const execPromise = (command, args) => {
             }
 
             // Resolve with both stdout and stderr
-            resolve({stdout, stderr});
+            resolve({ stdout, stderr });
         });
     });
 };
@@ -216,7 +216,7 @@ const regexes = {
     cnp: /\b[1-9]\d{12}\b/g,
     card: /\b(?:\d[ -]?){13,19}\b/g,
     iban: /\b[A-Z]{2}\d{2}[A-Z0-9]{8,30}\b/g,
-// Only redact 9+ digit numbers that don't look like YYYYMMDD or MMDDYYYY
+    // Only redact 9+ digit numbers that don't look like YYYYMMDD or MMDDYYYY
     longnum: /\b(?!\d{4}(?:0[1-9]|1[0-2])(?:[0-3]\d)|(?:0[1-9]|1[0-2])[0-3]\d\d{4})\d{9,}\b/g,
     // date: /\b(?:0?[1-9]|[12][0-9]|3[01])[-\/.](?:0?[1-9]|1[0-2])[-\/.](?:19|20)\d{2}\b/g,
     name: /\b(?:Dna|Dl|Doamna|Domnul|Mr|Mrs|Ms|Miss|Sir|Madam)?\s*(?:[A-ZĂÂÎȘȚ][a-zăâîșț]+|[A-ZĂÂÎȘȚ]{2,})(?:[\s-](?:[A-ZĂÂÎȘȚ][a-zăâîșț]+|[A-ZĂÂÎȘȚ]{2,})){1,4}\b/gu
@@ -232,7 +232,7 @@ function collectPIIMatches(lineText) {
             if (!txt) continue;
             const lower = txt.toLowerCase();
             if (NON_PII_TERMS.some(t => lower.includes(t))) continue;
-            matches.push({type, text: txt, start: m.index, end: m.index + txt.length});
+            matches.push({ type, text: txt, start: m.index, end: m.index + txt.length });
             if (m.index === re.lastIndex) re.lastIndex++;
         }
     }
@@ -254,7 +254,7 @@ async function safeGetDocument(opts) {
 function groupItemsIntoLines(itemsOrig) {
     const items = itemsOrig.map(it => {
         const t = it.transform || [1, 0, 0, 1, 0, 0];
-        return {...it, x: t[4], y: t[5], transform: t};
+        return { ...it, x: t[4], y: t[5], transform: t };
     }).sort((A, B) => {
         const dy = B.y - A.y;
         if (Math.abs(dy) > 3) return dy;
@@ -320,7 +320,7 @@ function groupItemsIntoLines(itemsOrig) {
             pieces.push(mapping[i].str);
             if (mapping[i].insertedSpace && i < mapping.length - 1) pieces.push(" ");
         }
-        return {text: pieces.join(""), mapping};
+        return { text: pieces.join(""), mapping };
     });
 
     return result;
@@ -393,7 +393,7 @@ async function pdfToImagePdf(pdfBytes) {
     // Convert to PNGs at 200 DPI
     await execPromise("pdftoppm", ["-png", "-r", "200", inFile, path.join(tmpDir, "page")]);
 
-// Collect page images
+    // Collect page images
     const images = fs.readdirSync(tmpDir)
         .filter(f => f.startsWith("page-") && f.endsWith(".png"))
         .map(f => path.join(tmpDir, f))
@@ -404,11 +404,11 @@ async function pdfToImagePdf(pdfBytes) {
         const imgBytes = fs.readFileSync(imgPath);
         const img = await pdfDoc.embedPng(imgBytes);
         const page = pdfDoc.addPage([img.width, img.height]);
-        page.drawImage(img, {x: 0, y: 0, width: img.width, height: img.height});
+        page.drawImage(img, { x: 0, y: 0, width: img.width, height: img.height });
     }
 
     const out = await pdfDoc.save();
-    fs.rmSync(tmpDir, {recursive: true, force: true});
+    fs.rmSync(tmpDir, { recursive: true, force: true });
     return out;
 }
 
@@ -520,11 +520,11 @@ async function extractTransactionsFromStatement(buffer, filename, mime) {
 
     const chunkingRules = `
 Output rules:
-1. Start each response with "CONTINUE ---" (if more transactions remain) or "END ---" (if this is the last batch).
+1. Return "CONTINUE ---" if there are more transactions remaining in the document. Return "END ---" ONLY if you have verified the document contains no more transactions (you've reached the absolute end).
 2. After the marker, output a JSON object: { "transactions": [ ... ] }
 3. Output up to ${BATCH_LIMIT} transactions per response.
 4. Do NOT wrap JSON in code fences.
-5. When asked to continue, repeat the last transaction as the first item, then continue with new ones.
+5. When asked to continue, provide the NEXT transactions after the cursor. Do NOT repeat the cursor transaction.
 `;
 
     console.log("[Gemini] Uploading file for", filename);
@@ -543,7 +543,7 @@ Output rules:
         throw new Error("Unsupported buffer type");
     }
 
-    const payloadBlob = new Blob([payloadBuffer], {type: mime || "application/pdf"});
+    const payloadBlob = new Blob([payloadBuffer], { type: mime || "application/pdf" });
     Object.defineProperty(payloadBlob, "size", { value: payloadBuffer.length });
     console.log(`[Gemini] Uploading file: ${fileDisplayName} (${(payloadBuffer.length / 1024 / 1024).toFixed(2)} MB)`);
 
@@ -568,13 +568,13 @@ Output rules:
     let fileState = upload?.state || "PROCESSING";
     let attempts = 0;
     const maxAttempts = 60; // 2 minutes max wait
-    
+
     while (fileState === "PROCESSING" && attempts < maxAttempts) {
         await new Promise(resolve => setTimeout(resolve, 2000)); // Wait 2 seconds
         const fileInfo = await googleAI.files.get({ name: fileName });
         fileState = fileInfo?.state || "ACTIVE";
         attempts++;
-        
+
         if (fileState === "ACTIVE") {
             console.log(`[Gemini] File ready after ${attempts * 2} seconds`);
             break;
@@ -582,7 +582,7 @@ Output rules:
             throw new Error("File processing failed in Gemini API");
         }
     }
-    
+
     if (fileState !== "ACTIVE") {
         throw new Error(`File not ready after ${maxAttempts * 2} seconds (state: ${fileState})`);
     }
@@ -633,9 +633,9 @@ Output rules:
                 return { transactions: [], hasEndMarker, hasContinueMarker, wasTruncated: false };
             }
             if (Array.isArray(parsed?.transactions)) {
-                return { 
-                    transactions: parsed.transactions, 
-                    hasEndMarker, 
+                return {
+                    transactions: parsed.transactions,
+                    hasEndMarker,
                     hasContinueMarker,
                     wasTruncated: false
                 };
@@ -645,7 +645,7 @@ Output rules:
         } catch (firstErr) {
             // JSON parse failed - likely truncated response
             console.warn("[Gemini] Initial JSON parse failed, extracting complete objects:", firstErr.message);
-            
+
             // Find the transactions array start
             const transArrayMatch = candidateJson.match(/"transactions"\s*:\s*\[/);
             if (!transArrayMatch) {
@@ -699,11 +699,11 @@ Output rules:
 
             if (completeTransactions.length > 0) {
                 console.log(`[Gemini] Extracted ${completeTransactions.length} complete transactions from truncated chunk`);
-                return { 
-                    transactions: completeTransactions, 
+                return {
+                    transactions: completeTransactions,
                     hasEndMarker: false, // Truncation means not ended
                     hasContinueMarker: true, // Should continue
-                    wasTruncated: true 
+                    wasTruncated: true
                 };
             } else {
                 console.error("[Gemini] No complete transactions extracted from chunk");
@@ -718,6 +718,8 @@ Output rules:
         let continueLoop = true;
         let part = 1;
         let lastCursor = null;
+        let consecutiveEmptyResponses = 0;
+        const maxConsecutiveEmpty = 2;
 
         // Create base conversation contents
         const initialUserParts = [
@@ -738,28 +740,46 @@ Output rules:
                     model: modelName,
                     contents: conversationHistory,
                 });
-                
-                const timeoutPromise = new Promise((_, reject) => 
-                    setTimeout(() => reject(new Error(`Timeout after ${timeoutMs/1000}s`)), timeoutMs)
+
+                const timeoutPromise = new Promise((_, reject) =>
+                    setTimeout(() => reject(new Error(`Timeout after ${timeoutMs / 1000}s`)), timeoutMs)
                 );
-                
+
                 const response = await Promise.race([responsePromise, timeoutPromise]);
 
                 const candidate = response.candidates?.[0];
                 if (!candidate?.content) {
                     console.warn(`[Gemini] [${modelName}] No candidate content in part ${part}`);
-                    break;
+                    consecutiveEmptyResponses++;
+                    if (consecutiveEmptyResponses >= maxConsecutiveEmpty) {
+                        console.warn(`[Gemini] [${modelName}] Reached max consecutive empty responses, stopping.`);
+                        break;
+                    }
+                    continue;
                 }
+                consecutiveEmptyResponses = 0; // Reset consecutive empty responses on successful response
 
                 const responseText = candidate.content.parts
                     ?.map((p) => p.text ?? "")
                     .join("")
                     .trim() || "";
 
+                // Log response body with truncation
+                if (responseText) {
+                    const first200 = responseText.slice(0, 200);
+                    const last200 = responseText.slice(-200);
+                    const bodyPreview = responseText.length > 400
+                        ? `${first200} ... ${last200}`
+                        : responseText;
+                    console.log(`[Gemini] [${modelName}] part ${part} response body:`, bodyPreview);
+                } else {
+                    console.log(`[Gemini] [${modelName}] part ${part} response body: (empty)`);
+                }
+
                 console.log(`[Gemini] [${modelName}] received part ${part}`);
 
                 const { transactions: newTransactions, hasEndMarker, hasContinueMarker, wasTruncated } = parseChunk(responseText);
-                
+
                 console.log(`[Gemini] [${modelName}] parsed ${newTransactions.length} transactions (end=${hasEndMarker}, continue=${hasContinueMarker}, truncated=${wasTruncated})`);
 
                 // Deduplicate and add new transactions
@@ -803,13 +823,25 @@ Output rules:
 
                     conversationHistory.push({ role: "user", parts: [{ text: continuePrompt }] });
                 } else {
-                    console.warn(`[Gemini] [${modelName}] No progress, stopping with ${aggregated.length} transactions`);
-                    continueLoop = false;
+                    consecutiveEmptyResponses++;
+                    if (consecutiveEmptyResponses >= maxConsecutiveEmpty) {
+                        console.warn(`[Gemini] [${modelName}] No progress after ${maxConsecutiveEmpty} retries, stopping with ${aggregated.length} transactions`);
+                        continueLoop = false;
+                    } else {
+                        console.log(`[Gemini] [${modelName}] No progress (empty response), retrying (${consecutiveEmptyResponses}/${maxConsecutiveEmpty})...`);
+                        let continuePrompt = "";
+                        if (lastCursor) {
+                            continuePrompt = `The last transaction you provided was:\n${JSON.stringify(lastCursor)}\n\nNow continue with the NEXT transactions that come AFTER this one. Do NOT repeat this transaction or any earlier ones. Start with "CONTINUE ---".`;
+                        } else {
+                            continuePrompt = "CONTINUE ---";
+                        }
+                        conversationHistory.push({ role: "user", parts: [{ text: continuePrompt }] });
+                    }
                 }
 
                 part++;
 
-    } catch (err) {
+            } catch (err) {
                 console.error(`[Gemini] [${modelName}] Error in part ${part}:`, {
                     message: err.message,
                     name: err.name,
@@ -819,21 +851,21 @@ Output rules:
                     errno: err.errno,
                     syscall: err.syscall
                 });
-                
+
                 // Check if it's a network error that might be transient
-                const isNetworkError = err.message?.includes('fetch failed') || 
-                                      err.message?.includes('ECONNRESET') ||
-                                      err.message?.includes('ETIMEDOUT') ||
-                                      err.code === 'ECONNRESET' ||
-                                      err.code === 'ETIMEDOUT';
-                
+                const isNetworkError = err.message?.includes('fetch failed') ||
+                    err.message?.includes('ECONNRESET') ||
+                    err.message?.includes('ETIMEDOUT') ||
+                    err.code === 'ECONNRESET' ||
+                    err.code === 'ETIMEDOUT';
+
                 if (isNetworkError && part === 1) {
                     // Retry first request once after network error
                     console.log(`[Gemini] [${modelName}] Retrying part ${part} after network error...`);
                     await new Promise(resolve => setTimeout(resolve, 5000)); // Wait 5s
                     continue; // Don't increment part, try again
                 }
-                
+
                 break;
             }
         }
@@ -845,8 +877,8 @@ Output rules:
         return aggregated;
     };
 
-    console.log("[Gemini] Uploaded file", {fileName, fileUri});
-    console.log("[Gemini] [gemini-2.5-flash] Initiating request for file ", {fileName, fileUri});
+    console.log("[Gemini] Uploaded file", { fileName, fileUri });
+    console.log("[Gemini] [gemini-2.5-flash] Initiating request for file ", { fileName, fileUri });
     let transactions = [];
     try {
         transactions = await collectTransactionsFromModel("gemini-2.5-flash");
@@ -856,7 +888,7 @@ Output rules:
         transactions = await collectTransactionsFromModel("gemini-2.0-flash");
     } finally {
         try {
-            await googleAI.files.delete({name: fileName});
+            await googleAI.files.delete({ name: fileName });
             console.log("[Gemini] Deleted uploaded file", fileName);
         } catch (deleteErr) {
             console.error("[Gemini] Failed to delete uploaded file", fileName, deleteErr);
@@ -896,7 +928,7 @@ function normalizeTransactions(input) {
 
 
         const title = (t?.title ?? "").toString();
-        return {date, title, debit, credit, amount, category, note};
+        return { date, title, debit, credit, amount, category, note };
     });
 }
 
@@ -904,7 +936,7 @@ async function redactPdf(pdfjsDoc, pdfDoc, debug) {
     for (let p = 0; p < pdfjsDoc.numPages; p++) {
         const pageNum = p + 1;
         const pdfjsPage = await pdfjsDoc.getPage(pageNum);
-        const textContent = await pdfjsPage.getTextContent({disableCombineTextItems: false});
+        const textContent = await pdfjsPage.getTextContent({ disableCombineTextItems: false });
         const pdfLibPage = pdfDoc.getPage(p);
 
         const itemsOrig = (textContent && textContent.items) || [];
@@ -922,13 +954,13 @@ async function redactPdf(pdfjsDoc, pdfDoc, debug) {
             // Merge overlapping matches
             const merged = [];
             for (const m of matches) {
-                if (!merged.length) merged.push({...m});
+                if (!merged.length) merged.push({ ...m });
                 else {
                     const last = merged[merged.length - 1];
                     if (m.start <= last.end) {
                         last.end = Math.max(last.end, m.end);
                         last.text = lineText.slice(last.start, last.end);
-                    } else merged.push({...m});
+                    } else merged.push({ ...m });
                 }
             }
 
@@ -960,7 +992,7 @@ async function redactPdf(pdfjsDoc, pdfDoc, debug) {
 
                         // End current word
                         if (i > currentStart) {
-                            subSpans.push({start: currentStart, end: i});
+                            subSpans.push({ start: currentStart, end: i });
                         }
                         inWord = false;
 
@@ -973,7 +1005,7 @@ async function redactPdf(pdfjsDoc, pdfDoc, debug) {
 
                 // If no splits found, use the whole span
                 if (subSpans.length === 0) {
-                    subSpans.push({start: span.start, end: span.end});
+                    subSpans.push({ start: span.start, end: span.end });
                 }
 
                 // Draw rectangle for each sub-span
@@ -1043,7 +1075,7 @@ function deriveCsvName(original) {
 }
 
 async function markJobReady(supabase, jobId, generatedFileId) {
-    const {error} = await supabase
+    const { error } = await supabase
         .from("statement_jobs")
         .update({
             status: "ready",
@@ -1071,7 +1103,7 @@ async function markJobErrored(supabase, jobId, message) {
 }
 
 async function insertStatementJob(supabase, userId, file) {
-    const {data, error} = await supabase
+    const { data, error } = await supabase
         .from("statement_jobs")
         .insert({
             user_id: userId,
@@ -1092,7 +1124,7 @@ async function insertStatementJob(supabase, userId, file) {
 
 async function countPdfPages(buffer) {
     try {
-        const pdfDoc = await PDFDocument.load(buffer, {ignoreEncryption: true});
+        const pdfDoc = await PDFDocument.load(buffer, { ignoreEncryption: true });
         const pages = pdfDoc.getPageCount();
         return pages > 0 ? pages : 1;
     } catch {
@@ -1136,9 +1168,9 @@ async function uploadToGCS(buffer, filename, mime) {
 
     try {
         await file.save(payload, {
-        contentType: mime,
-        resumable: false,
-    });
+            contentType: mime,
+            resumable: false,
+        });
     } catch (err) {
         console.error("[GCS upload] Failed", {
             bucket: TEMP_BUCKET,
@@ -1157,7 +1189,7 @@ async function uploadToGCS(buffer, filename, mime) {
         expires: Date.now() + 1000 * 60 * 60, // 1 hour temporary URL
     });
 
-    return {gcsPath: `gs://${TEMP_BUCKET}/${objectName}`, url};
+    return { gcsPath: `gs://${TEMP_BUCKET}/${objectName}`, url };
 }
 
 
@@ -1168,14 +1200,14 @@ async function process(encodings, jobRecords, user, adminSupabase) {
         const file = encodings[index];
         const job = jobRecords[index];
         try {
-            logWithMeta("Processing file", {filename: file.name});
+            logWithMeta("Processing file", { filename: file.name });
             console.log(`Content redaction started for file ` + (file.name || "unknown"));
 
             const debug = false;
             const pdfBytes = file.buffer;
             const data = new Uint8Array(pdfBytes);
-            const pdfjsDoc = await safeGetDocument({data});
-            const pdfDoc = await PDFDocument.load(pdfBytes, {ignoreEncryption: true}); // optional flag
+            const pdfjsDoc = await safeGetDocument({ data });
+            const pdfDoc = await PDFDocument.load(pdfBytes, { ignoreEncryption: true }); // optional flag
 
             await redactPdf(pdfjsDoc, pdfDoc, debug);
 
@@ -1228,7 +1260,7 @@ async function process(encodings, jobRecords, user, adminSupabase) {
             const csv = toCsv(transactions);
             const filename = deriveCsvName(file.name);
 
-            const {data: inserted, error} = await adminSupabase
+            const { data: inserted, error } = await adminSupabase
                 .from("generated_files")
                 .insert({
                     user_id: user.id,
@@ -1257,7 +1289,7 @@ async function process(encodings, jobRecords, user, adminSupabase) {
             const message = err instanceof Error ? err.message : "Unknown error";
             console.error("Async processing failed for", file.name, err);
             await markJobErrored(adminSupabase, job.id, message);
-            logWithMeta("Processing failed", {filename: file.name, error: message});
+            logWithMeta("Processing failed", { filename: file.name, error: message });
         }
     }
 
@@ -1280,6 +1312,7 @@ async function process(encodings, jobRecords, user, adminSupabase) {
     }
 }
 
+const isLocal = true;
 app.post("/process", verifyAuth, upload.array("files"), async (req, res) => {
     try {
         if (!req.files || !req.files.length) {
@@ -1289,7 +1322,7 @@ app.post("/process", verifyAuth, upload.array("files"), async (req, res) => {
         const adminSupabase = createAdminClient();
         const supabase = await createSupabaseClient(req, res);
         const {
-            data: {user},
+            data: { user },
             error,
         } = await supabase.auth.getUser();
 
@@ -1303,7 +1336,7 @@ app.post("/process", verifyAuth, upload.array("files"), async (req, res) => {
             const mime = file.mimetype || "application/octet-stream";
             const isPdf = mime === "application/pdf" || /\.pdf$/i.test(name);
             const credits = isPdf ? await countPdfPages(buffer) : 1;
-            const {gcsPath, url} = await uploadToGCS(buffer, name, mime);
+            const { gcsPath, url } = await uploadToGCS(buffer, name, mime);
 
             filesMeta.push({
                 name,
@@ -1332,67 +1365,67 @@ app.post("/process", verifyAuth, upload.array("files"), async (req, res) => {
         const bearerToken = authHeader?.startsWith("Bearer ") ? authHeader.split(" ")[1] : null;
 
         if (!bearerToken) {
-            return res.status(401).json({error: "Missing authorization token"});
+            return res.status(401).json({ error: "Missing authorization token" });
         }
 
 
         console.log('-------BODY-------------\n', JSON.stringify({
             jobRecords,
-            files: filesMeta.map(({name, mime, credits, gcsPath}) => ({name, mime, credits, gcsPath})),
+            files: filesMeta.map(({ name, mime, credits, gcsPath }) => ({ name, mime, credits, gcsPath })),
         }))
 
 
-        //for local, do not delete TODO refactor
-        // fetch("http://localhost:8080/tasks/run/async", {
-        //     method: "POST",
-        //         headers: {
-        //             "Content-Type": "application/json",
-        //             "Authorization": `Bearer ${bearerToken}`,
-        //         },
-        //     body: JSON.stringify({
-        //         jobRecords,
-        //         files: filesMeta.map(({name, mime, credits, gcsPath}) => ({name, mime, credits, gcsPath})),
-        //     }),
-        // }).then((resp) => {
-        //     if (!resp.ok) {
-        //         return resp.text().then((t) => console.error("Task dispatch failed:", resp.status, t));
-        //     } else {
-        //         res.json(resp.text());
-        //     }
-        //     console.log("Background task dispatched");
-        // }).catch((err) => {
-        //     console.error("Failed to dispatch background task:", err);
-        // });
-
-
-        const taskPayload = {
-            jobRecords,
-            files: filesMeta.map(({name, mime, credits, gcsPath}) => ({name, mime, credits, gcsPath}))
-        };
-
-        const queuePath = tasksClient.queuePath(
-            "bankstatement2csv",
-            "us-central1",
-            "pdf-jobs-queue"
-        );
-
-        const task = {
-            httpRequest: {
-                httpMethod: "POST",
-                url: `https://bankstatement2csv.uc.r.appspot.com/tasks/run/async`,
+        if (isLocal) {
+            fetch("http://localhost:8080/tasks/run/async", {
+                method: "POST",
                 headers: {
                     "Content-Type": "application/json",
                     "Authorization": `Bearer ${bearerToken}`,
                 },
-                body: Buffer.from(JSON.stringify(taskPayload)).toString("base64"),
-            },
-            dispatchDeadline: { seconds: 1800 }, // 30 minutes (max),
-        };
-
-        await tasksClient.createTask({parent: queuePath, task});
-
-        // === Respond immediately ===
-        res.json(jobRecords);
+                body: JSON.stringify({
+                    jobRecords,
+                    files: filesMeta.map(({ name, mime, credits, gcsPath }) => ({ name, mime, credits, gcsPath })),
+                }),
+            }).then((resp) => {
+                if (!resp.ok) {
+                    return resp.text().then((t) => console.error("Task dispatch failed:", resp.status, t));
+                } else {
+                    res.json(resp.text());
+                }
+                console.log("Background task dispatched");
+            }).catch((err) => {
+                console.error("Failed to dispatch background task:", err);
+            });
+        } else {
+            const taskPayload = {
+                jobRecords,
+                files: filesMeta.map(({ name, mime, credits, gcsPath }) => ({ name, mime, credits, gcsPath }))
+            };
+    
+            const queuePath = tasksClient.queuePath(
+                "bankstatement2csv",
+                "us-central1",
+                "pdf-jobs-queue"
+            );
+    
+            const task = {
+                httpRequest: {
+                    httpMethod: "POST",
+                    url: `https://bankstatement2csv.uc.r.appspot.com/tasks/run/async`,
+                    headers: {
+                        "Content-Type": "application/json",
+                        "Authorization": `Bearer ${bearerToken}`,
+                    },
+                    body: Buffer.from(JSON.stringify(taskPayload)).toString("base64"),
+                },
+                dispatchDeadline: { seconds: 1800 }, // 30 minutes (max),
+            };
+    
+            await tasksClient.createTask({ parent: queuePath, task });
+    
+            // === Respond immediately ===
+            res.json(jobRecords);
+        }
     } catch (err) {
         console.error("❌ Error:", err);
         if (!res.headersSent) {
@@ -1411,7 +1444,7 @@ app.post("/tasks/run/async", async (req, res) => {
 
         if (!token) {
             console.error("❌ Missing authorization token in Cloud Task");
-            return res.status(401).json({error: "Missing authorization token"});
+            return res.status(401).json({ error: "Missing authorization token" });
         }
 
         let user;
@@ -1419,7 +1452,7 @@ app.post("/tasks/run/async", async (req, res) => {
             user = await getUserFromToken(token);
         } catch (err) {
             console.error("❌ Invalid token in Cloud Task:", err.message);
-            return res.status(401).json({error: err.message});
+            return res.status(401).json({ error: err.message });
         }
 
         const adminSupabase = createAdminClient();
@@ -1427,7 +1460,7 @@ app.post("/tasks/run/async", async (req, res) => {
         const requestBody = Buffer.isBuffer(req.body) ? req.body : Buffer.from(JSON.stringify(req.body || {}));
         const payload = JSON.parse(requestBody.toString());
 
-        const {jobRecords, files} = payload || {};
+        const { jobRecords, files } = payload || {};
 
         if (!Array.isArray(jobRecords) || !Array.isArray(files)) {
             throw new Error("Task payload missing jobRecords/files");
@@ -1439,7 +1472,7 @@ app.post("/tasks/run/async", async (req, res) => {
         });
 
         // === Respond immediately with 200 OK ===
-        res.status(200).json({status: "Task accepted", taskId: jobRecords[0]?.id});
+        res.status(200).json({ status: "Task accepted", taskId: jobRecords[0]?.id });
 
         // === Process files in the background (don't await) ===
         (async () => {
@@ -1470,7 +1503,7 @@ app.post("/tasks/run/async", async (req, res) => {
                             }
 
                             console.log(`✓ Downloaded ${file.name} (${buffer.length} bytes)`);
-                            
+
                             return {
                                 name: file.name,
                                 mime: file.mime,
@@ -1500,7 +1533,7 @@ app.post("/tasks/run/async", async (req, res) => {
     } catch (err) {
         console.error("❌ Task validation error:", err);
         if (!res.headersSent) {
-            res.status(500).json({error: "Task failed: " + err.message});
+            res.status(500).json({ error: "Task failed: " + err.message });
         }
     }
 });
