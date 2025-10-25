@@ -216,7 +216,7 @@ const regexes = {
     cnp: /\b[1-9]\d{12}\b/g,
     card: /\b(?:\d[ -]?){13,19}\b/g,
     iban: /\b[A-Z]{2}\d{2}[A-Z0-9]{8,30}\b/g,
-    // Only redact 9+ digit numbers that don't look like YYYYMMDD or MMDDYYYY
+// Only redact 9+ digit numbers that don't look like YYYYMMDD or MMDDYYYY
     longnum: /\b(?!\d{4}(?:0[1-9]|1[0-2])(?:[0-3]\d)|(?:0[1-9]|1[0-2])[0-3]\d\d{4})\d{9,}\b/g,
     // date: /\b(?:0?[1-9]|[12][0-9]|3[01])[-\/.](?:0?[1-9]|1[0-2])[-\/.](?:19|20)\d{2}\b/g,
     name: /\b(?:Dna|Dl|Doamna|Domnul|Mr|Mrs|Ms|Miss|Sir|Madam)?\s*(?:[A-ZĂÂÎȘȚ][a-zăâîșț]+|[A-ZĂÂÎȘȚ]{2,})(?:[\s-](?:[A-ZĂÂÎȘȚ][a-zăâîșț]+|[A-ZĂÂÎȘȚ]{2,})){1,4}\b/gu
@@ -393,7 +393,7 @@ async function pdfToImagePdf(pdfBytes) {
     // Convert to PNGs at 200 DPI
     await execPromise("pdftoppm", ["-png", "-r", "200", inFile, path.join(tmpDir, "page")]);
 
-    // Collect page images
+// Collect page images
     const images = fs.readdirSync(tmpDir)
         .filter(f => f.startsWith("page-") && f.endsWith(".png"))
         .map(f => path.join(tmpDir, f))
@@ -510,26 +510,10 @@ The previous output repeated earlier rows. Carefully scan forward to find new pa
     return prompt;
 }
 
-async function extractTransactionsFromStatement(buffer, filename, mime) {
-    const BATCH_LIMIT = 200;
-    const cursor = null;
-    const history = [];
-    const duplicateRuns = 0;
-
-    const basePrompt = buildExtractionPrompt(BATCH_LIMIT, cursor, duplicateRuns > 0, history);
-
-    const chunkingRules = `
-Output rules:
-1. Return "CONTINUE ---" if there are more transactions remaining in the document. Return "END ---" ONLY if you have verified the document contains no more transactions (you've reached the absolute end).
-2. After the marker, output a JSON object: { "transactions": [ ... ] }
-3. Output up to ${BATCH_LIMIT} transactions per response.
-4. Do NOT wrap JSON in code fences.
-5. When asked to continue, provide the NEXT transactions after the cursor. Do NOT repeat the cursor transaction.
-`;
-
-    console.log("[Gemini] Uploading file for", filename);
-    const fileDisplayName = filename || `statement-${Date.now()}.pdf`;
-
+/**
+ * Split a PDF into multiple chunks of specified page size
+ */
+async function splitPdfIntoChunks(buffer, pagesPerChunk = 5) {
     let payloadBuffer;
     if (Buffer.isBuffer(buffer)) {
         payloadBuffer = buffer;
@@ -543,28 +527,64 @@ Output rules:
         throw new Error("Unsupported buffer type");
     }
 
-    const payloadBlob = new Blob([payloadBuffer], { type: mime || "application/pdf" });
-    Object.defineProperty(payloadBlob, "size", { value: payloadBuffer.length });
-    console.log(`[Gemini] Uploading file: ${fileDisplayName} (${(payloadBuffer.length / 1024 / 1024).toFixed(2)} MB)`);
+    // Load the PDF
+    const pdfDoc = await PDFDocument.load(payloadBuffer);
+    const totalPages = pdfDoc.getPageCount();
+    console.log(`[PDF Split] Total pages: ${totalPages}, splitting into chunks of ${pagesPerChunk} pages`);
+
+    const chunks = [];
+    for (let startPage = 0; startPage < totalPages; startPage += pagesPerChunk) {
+        const endPage = Math.min(startPage + pagesPerChunk, totalPages);
+        
+        // Create a new PDF document for this chunk
+        const chunkDoc = await PDFDocument.create();
+        
+        // Copy pages from original PDF to chunk
+        const copiedPages = await chunkDoc.copyPages(pdfDoc, Array.from({ length: endPage - startPage }, (_, i) => startPage + i));
+        copiedPages.forEach(page => chunkDoc.addPage(page));
+        
+        // Save the chunk as a buffer
+        const chunkBuffer = Buffer.from(await chunkDoc.save());
+        
+        chunks.push({
+            buffer: chunkBuffer,
+            startPage: startPage + 1, // 1-indexed for display
+            endPage: endPage,
+            pageCount: endPage - startPage
+        });
+        
+        console.log(`[PDF Split] Created chunk ${chunks.length}: pages ${startPage + 1}-${endPage} (${endPage - startPage} pages, ${(chunkBuffer.length / 1024).toFixed(2)} KB)`);
+    }
+
+    return chunks;
+}
+
+/**
+ * Upload a PDF chunk to Gemini Files API and wait for it to be ready
+ */
+async function uploadPdfChunkToGemini(chunkBuffer, displayName, mime) {
+    const payloadBlob = new Blob([chunkBuffer], { type: mime || "application/pdf" });
+    Object.defineProperty(payloadBlob, "size", { value: chunkBuffer.length });
+    
+    console.log(`[Gemini] Uploading chunk: ${displayName} (${(chunkBuffer.length / 1024 / 1024).toFixed(2)} MB)`);
 
     const upload = await googleAI.files.upload({
         file: payloadBlob,
         config: {
             mimeType: mime || "application/pdf",
-            displayName: fileDisplayName,
+            displayName: displayName,
         }
     });
     const fileName = upload?.name;
     const fileUri = upload?.uri;
 
     if (!fileName || !fileUri) {
-        throw new Error("Failed to upload file to Gemini Files API");
+        throw new Error("Failed to upload chunk to Gemini Files API");
     }
 
-    console.log(`[Gemini] File uploaded successfully: ${fileName} (initial state: ${upload?.state || "UNKNOWN"})`);
+    console.log(`[Gemini] Chunk uploaded: ${fileName} (initial state: ${upload?.state || "UNKNOWN"})`);
 
     // Wait for file to be processed before using it
-    console.log("[Gemini] Waiting for file to be processed...");
     let fileState = upload?.state || "PROCESSING";
     let attempts = 0;
     const maxAttempts = 60; // 2 minutes max wait
@@ -576,326 +596,328 @@ Output rules:
         attempts++;
 
         if (fileState === "ACTIVE") {
-            console.log(`[Gemini] File ready after ${attempts * 2} seconds`);
+            console.log(`[Gemini] Chunk ready after ${attempts * 2} seconds`);
             break;
         } else if (fileState === "FAILED") {
-            throw new Error("File processing failed in Gemini API");
+            throw new Error("Chunk processing failed in Gemini API");
         }
     }
 
     if (fileState !== "ACTIVE") {
-        throw new Error(`File not ready after ${maxAttempts * 2} seconds (state: ${fileState})`);
+        throw new Error(`Chunk not ready after ${maxAttempts * 2} seconds (state: ${fileState})`);
     }
 
-    const CONTINUE_MARKER = "CONTINUE ---";
+    return { fileName, fileUri };
+}
+
+async function extractTransactionsFromStatement(buffer, filename, mime) {
+    const BATCH_LIMIT = 250;
+    const cursor = null;
+    const history = [];
+    const duplicateRuns = 0;
+
+    const basePrompt = buildExtractionPrompt(BATCH_LIMIT, cursor, duplicateRuns > 0, history);
+
+    const chunkingRules = `
+Output rules:
+1. Extract ALL transactions from this document chunk in chronological order.
+2. Output a JSON object: { "transactions": [ ... ] }
+3. Do NOT wrap JSON in code fences.
+4. Return "END ---" followed by the JSON when you have extracted all transactions from this chunk.
+`;
+
+    console.log("[Gemini] Processing file:", filename);
+    const fileDisplayName = filename || `statement-${Date.now()}.pdf`;
+
     const END_MARKER = "END ---";
 
     const parseChunk = (rawText) => {
-        if (!rawText) return { transactions: [], hasEndMarker: false, hasContinueMarker: false, wasTruncated: false };
+        if (!rawText) return { transactions: [] };
 
-        const trimmed = rawText.trim();
-        // STRICT marker detection - only at the very start of response
-        const hasEndMarker = trimmed.startsWith(END_MARKER);
-        const hasContinueMarker = trimmed.startsWith(CONTINUE_MARKER);
-
-        let remainder = trimmed;
-
-        if (hasContinueMarker) {
-            remainder = trimmed.slice(CONTINUE_MARKER.length).trim();
-        } else if (hasEndMarker) {
-            remainder = trimmed.slice(END_MARKER.length).trim();
+        let cleaned = rawText.trim();
+        
+        // Remove END marker if present
+        if (cleaned.startsWith(END_MARKER)) {
+            cleaned = cleaned.slice(END_MARKER.length).trim();
         }
-
-        remainder = remainder
-            .replace(/---\s*(CONTINUE|END)\s*---/gi, "")
-            .replace(/```json\s*/gi, "")
+        
+        // Remove all variations of markdown code fences and markers
+        cleaned = cleaned
+            .replace(/```json/gi, "")
             .replace(/```/g, "")
+            .replace(/---\s*END\s*---/gi, "")
             .replace(/JsonArray|JsonObject|JsonValue/gi, "")
             .trim();
 
-        let candidateJson = remainder;
-        if (!candidateJson.startsWith("{")) {
-            const firstBrace = candidateJson.indexOf('{');
-            if (firstBrace >= 0) {
-                candidateJson = candidateJson.slice(firstBrace);
-            }
+        // Find the first { and extract JSON from there
+        const firstBrace = cleaned.indexOf('{');
+        if (firstBrace < 0) {
+            console.warn("[Gemini] No JSON object found in response");
+            return { transactions: [] };
+        }
+        
+        let candidateJson = cleaned.slice(firstBrace);
+        
+        // Find the last } to close the JSON object
+        const lastBrace = candidateJson.lastIndexOf('}');
+        if (lastBrace >= 0) {
+            candidateJson = candidateJson.slice(0, lastBrace + 1);
         }
 
         if (!candidateJson) {
-            return { transactions: [], hasEndMarker, hasContinueMarker, wasTruncated: false };
+            return { transactions: [] };
         }
 
-        // First, try parsing as complete JSON
+        // Try parsing as complete JSON
         try {
             const parsed = JSON.parse(candidateJson);
             if (parsed?.error) {
                 console.warn("[Gemini] Chunk contains error payload", parsed.error);
-                return { transactions: [], hasEndMarker, hasContinueMarker, wasTruncated: false };
+                return { transactions: [] };
             }
             if (Array.isArray(parsed?.transactions)) {
-                return {
-                    transactions: parsed.transactions,
-                    hasEndMarker,
-                    hasContinueMarker,
-                    wasTruncated: false
-                };
+                return { transactions: parsed.transactions };
             }
             console.warn("[Gemini] Parsed JSON lacks transactions array", parsed);
-            return { transactions: [], hasEndMarker, hasContinueMarker, wasTruncated: false };
+            return { transactions: [] };
         } catch (firstErr) {
-            // JSON parse failed - likely truncated response
-            console.warn("[Gemini] Initial JSON parse failed, extracting complete objects:", firstErr.message);
-
-            // Find the transactions array start
-            const transArrayMatch = candidateJson.match(/"transactions"\s*:\s*\[/);
-            if (!transArrayMatch) {
-                console.error("[Gemini] Cannot find transactions array in chunk");
-                return { transactions: [], hasEndMarker, hasContinueMarker, wasTruncated: true };
-            }
-
-            const arrayStart = transArrayMatch.index + transArrayMatch[0].length;
-            const completeTransactions = [];
-            let depth = 0;
-            let inString = false;
-            let escapeNext = false;
-            let objStart = -1;
-
-            // Walk through the array and extract complete objects
-            for (let i = arrayStart; i < candidateJson.length; i++) {
-                const char = candidateJson[i];
-
-                if (escapeNext) {
-                    escapeNext = false;
-                    continue;
-                }
-                if (char === '\\') {
-                    escapeNext = true;
-                    continue;
-                }
-                if (char === '"') {
-                    inString = !inString;
-                    continue;
-                }
-                if (inString) continue;
-
-                if (char === '{') {
-                    if (depth === 0) objStart = i;
-                    depth++;
-                } else if (char === '}') {
-                    depth--;
-                    if (depth === 0 && objStart >= 0) {
-                        // Found a complete object
-                        const objText = candidateJson.slice(objStart, i + 1);
-                        try {
-                            const txn = JSON.parse(objText);
-                            completeTransactions.push(txn);
-                        } catch (objErr) {
-                            console.warn("[Gemini] Failed to parse individual transaction object:", objErr.message, objText.slice(0, 200));
-                        }
-                        objStart = -1;
-                    }
-                }
-            }
-
-            if (completeTransactions.length > 0) {
-                console.log(`[Gemini] Extracted ${completeTransactions.length} complete transactions from truncated chunk`);
-                return {
-                    transactions: completeTransactions,
-                    hasEndMarker: false, // Truncation means not ended
-                    hasContinueMarker: true, // Should continue
-                    wasTruncated: true
-                };
-            } else {
-                console.error("[Gemini] No complete transactions extracted from chunk");
-                return { transactions: [], hasEndMarker, hasContinueMarker, wasTruncated: true };
-            }
+            console.warn("[Gemini] JSON parse failed for chunk:", firstErr.message);
+            console.warn("[Gemini] Attempted to parse:", candidateJson.slice(0, 500));
+            return { transactions: [] };
         }
     };
 
-    const collectTransactionsFromModel = async (modelName) => {
-        const aggregated = [];
-        const seen = new Set();
-        let continueLoop = true;
-        let part = 1;
-        let lastCursor = null;
-        let consecutiveEmptyResponses = 0;
-        const maxConsecutiveEmpty = 2;
+    /**
+     * Process a single PDF chunk with Gemini
+     */
+    const processChunkWithGemini = async (fileUri, chunkIndex, totalChunks, modelName) => {
+        console.log(`[Gemini] [${modelName}] Processing chunk ${chunkIndex}/${totalChunks}`);
+        
+        const prompt = `${basePrompt}\n\n${chunkingRules}
 
-        // Create base conversation contents
-        const initialUserParts = [
-            { text: `${basePrompt}\n\n${chunkingRules}` },
-            { fileData: { mimeType: mime || "application/pdf", fileUri } }
-        ];
+This is chunk ${chunkIndex} of ${totalChunks} from the complete statement.
+Extract ALL transactions from this chunk in chronological order.`;
 
-        // We'll reuse this base to rebuild conversation each iteration.
-        let conversationHistory = [
-            { role: "user", parts: initialUserParts }
-        ];
-
-        while (continueLoop && part <= 200) {
-            try {
-                // Add simple timeout to prevent infinite hangs
-                const timeoutMs = 3599000; // 59 minutes and 59 seconds
-                const responsePromise = googleAI.models.generateContent({
-                    model: modelName,
-                    contents: conversationHistory,
-                });
-
-                const timeoutPromise = new Promise((_, reject) =>
-                    setTimeout(() => reject(new Error(`Timeout after ${timeoutMs / 1000}s`)), timeoutMs)
-                );
-
-                const response = await Promise.race([responsePromise, timeoutPromise]);
-
-                const candidate = response.candidates?.[0];
-                if (!candidate?.content) {
-                    console.warn(`[Gemini] [${modelName}] No candidate content in part ${part}`);
-                    consecutiveEmptyResponses++;
-                    if (consecutiveEmptyResponses >= maxConsecutiveEmpty) {
-                        console.warn(`[Gemini] [${modelName}] Reached max consecutive empty responses, stopping.`);
-                        break;
-                    }
-                    continue;
-                }
-                consecutiveEmptyResponses = 0; // Reset consecutive empty responses on successful response
-
-                const responseText = candidate.content.parts
-                    ?.map((p) => p.text ?? "")
-                    .join("")
-                    .trim() || "";
-
-                // Log response body with truncation
-                if (responseText) {
-                    const first200 = responseText.slice(0, 200);
-                    const last200 = responseText.slice(-200);
-                    const bodyPreview = responseText.length > 400
-                        ? `${first200} ... ${last200}`
-                        : responseText;
-                    console.log(`[Gemini] [${modelName}] part ${part} response body:`, bodyPreview);
-                } else {
-                    console.log(`[Gemini] [${modelName}] part ${part} response body: (empty)`);
-                }
-
-                console.log(`[Gemini] [${modelName}] received part ${part}`);
-
-                const { transactions: newTransactions, hasEndMarker, hasContinueMarker, wasTruncated } = parseChunk(responseText);
-
-                console.log(`[Gemini] [${modelName}] parsed ${newTransactions.length} transactions (end=${hasEndMarker}, continue=${hasContinueMarker}, truncated=${wasTruncated})`);
-
-                // Deduplicate and add new transactions
-                let addedCount = 0;
-                for (const txn of newTransactions) {
-                    const key = JSON.stringify([
-                        txn.date ?? "",
-                        txn.title ?? "",
-                        txn.debit ?? 0,
-                        txn.credit ?? 0,
-                        txn.amount ?? 0,
-                        (txn.note ?? "").slice(0, 100),
-                    ]);
-                    if (!seen.has(key)) {
-                        seen.add(key);
-                        aggregated.push(txn);
-                        addedCount++;
-                    }
-                }
-
-                console.log(`[Gemini] [${modelName}] added ${addedCount} new transactions (total: ${aggregated.length})`);
-
-                if (newTransactions.length > 0) {
-                    lastCursor = newTransactions[newTransactions.length - 1];
-                }
-
-                // Append the model response to history
-                conversationHistory.push({ role: "model", parts: [{ text: responseText }] });
-
-                // Decide next action & update conversation history
-                if (hasEndMarker && !wasTruncated) {
-                    console.log(`[Gemini] [${modelName}] End marker, finishing with ${aggregated.length} total transactions`);
-                    continueLoop = false;
-                } else if (wasTruncated || hasContinueMarker || newTransactions.length > 0) {
-                    let continuePrompt = "";
-                    if (lastCursor) {
-                        continuePrompt = `The last transaction you provided was:\n${JSON.stringify(lastCursor)}\n\nNow continue with the NEXT transactions that come AFTER this one. Do NOT repeat this transaction or any earlier ones. Start with "CONTINUE ---".`;
-                    } else {
-                        continuePrompt = "CONTINUE ---";
-                    }
-
-                    conversationHistory.push({ role: "user", parts: [{ text: continuePrompt }] });
-                } else {
-                    consecutiveEmptyResponses++;
-                    if (consecutiveEmptyResponses >= maxConsecutiveEmpty) {
-                        console.warn(`[Gemini] [${modelName}] No progress after ${maxConsecutiveEmpty} retries, stopping with ${aggregated.length} transactions`);
-                        continueLoop = false;
-                    } else {
-                        console.log(`[Gemini] [${modelName}] No progress (empty response), retrying (${consecutiveEmptyResponses}/${maxConsecutiveEmpty})...`);
-                        let continuePrompt = "";
-                        if (lastCursor) {
-                            continuePrompt = `The last transaction you provided was:\n${JSON.stringify(lastCursor)}\n\nNow continue with the NEXT transactions that come AFTER this one. Do NOT repeat this transaction or any earlier ones. Start with "CONTINUE ---".`;
-                        } else {
-                            continuePrompt = "CONTINUE ---";
-                        }
-                        conversationHistory.push({ role: "user", parts: [{ text: continuePrompt }] });
-                    }
-                }
-
-                part++;
-
-            } catch (err) {
-                console.error(`[Gemini] [${modelName}] Error in part ${part}:`, {
-                    message: err.message,
-                    name: err.name,
-                    cause: err.cause,
-                    stack: err.stack?.split('\n').slice(0, 3).join('\n'), // First 3 lines
-                    code: err.code,
-                    errno: err.errno,
-                    syscall: err.syscall
-                });
-
-                // Check if it's a network error that might be transient
-                const isNetworkError = err.message?.includes('fetch failed') ||
-                    err.message?.includes('ECONNRESET') ||
-                    err.message?.includes('ETIMEDOUT') ||
-                    err.code === 'ECONNRESET' ||
-                    err.code === 'ETIMEDOUT';
-
-                if (isNetworkError && part === 1) {
-                    // Retry first request once after network error
-                    console.log(`[Gemini] [${modelName}] Retrying part ${part} after network error...`);
-                    await new Promise(resolve => setTimeout(resolve, 5000)); // Wait 5s
-                    continue; // Don't increment part, try again
-                }
-
-                break;
+        const conversationHistory = [
+            {
+                role: "user",
+                parts: [
+                    { text: prompt },
+                    { fileData: { mimeType: mime || "application/pdf", fileUri } }
+                ]
             }
+        ];
+
+        // Log the prompt being sent to Gemini
+        console.log(`[Gemini] [${modelName}] chunk ${chunkIndex} request - conversation turns: ${conversationHistory.length}`);
+        for (let i = 0; i < conversationHistory.length; i++) {
+            const turn = conversationHistory[i];
+            const isFileInPart = turn.parts?.some(p => p.fileData);
+            const textContent = turn.parts?.find(p => p.text)?.text || "";
+            const preview = textContent.length > 300 
+                ? textContent.slice(0, 300) + "..." 
+                : textContent;
+            console.log(`  [Turn ${i + 1}] role: ${turn.role}${isFileInPart ? ' [+FILE]' : ''} | text: ${preview}`);
         }
 
-        if (part > 200) {
-            console.warn(`[Gemini] [${modelName}] Reached maximum iterations with ${aggregated.length} transactions`);
-        }
+        const timeoutMs = 300000; // 5 minutes per chunk
 
-        return aggregated;
-    };
-
-    console.log("[Gemini] Uploaded file", { fileName, fileUri });
-    console.log("[Gemini] [gemini-2.5-flash] Initiating request for file ", { fileName, fileUri });
-    let transactions = [];
-    try {
-        transactions = await collectTransactionsFromModel("gemini-2.5-flash");
-    } catch (err) {
-        console.error('[Gemini] [gemini-2.5-flash] failed ', err);
-        console.log("[Gemini] [gemini-2.0-flash] Initiate request for file ", filename);
-        transactions = await collectTransactionsFromModel("gemini-2.0-flash");
-    } finally {
         try {
-            await googleAI.files.delete({ name: fileName });
-            console.log("[Gemini] Deleted uploaded file", fileName);
-        } catch (deleteErr) {
-            console.error("[Gemini] Failed to delete uploaded file", fileName, deleteErr);
+            const responsePromise = googleAI.models.generateContent({
+                model: modelName,
+                contents: conversationHistory,
+            });
+
+            const timeoutPromise = new Promise((_, reject) =>
+                setTimeout(() => reject(new Error(`Timeout after ${timeoutMs / 1000}s`)), timeoutMs)
+            );
+
+            const response = await Promise.race([responsePromise, timeoutPromise]);
+
+            const candidate = response.candidates?.[0];
+            if (!candidate?.content) {
+                console.warn(`[Gemini] [${modelName}] No candidate content for chunk ${chunkIndex}`);
+                return [];
+            }
+
+            const responseText = candidate.content.parts
+                ?.map((p) => p.text ?? "")
+                .join("")
+                .trim() || "";
+
+            // Log response body with truncation (first 200 and last 200 chars)
+            if (responseText) {
+                const first200 = responseText.slice(0, 200);
+                const last200 = responseText.slice(-200);
+                const bodyPreview = responseText.length > 400
+                    ? `${first200} ... ${last200}`
+                    : responseText;
+                console.log(`[Gemini] [${modelName}] chunk ${chunkIndex} response body:`, bodyPreview);
+            } else {
+                console.log(`[Gemini] [${modelName}] chunk ${chunkIndex} response body: (empty)`);
+            }
+
+            const { transactions } = parseChunk(responseText);
+            console.log(`[Gemini] [${modelName}] chunk ${chunkIndex} extracted ${transactions.length} transactions`);
+            
+            return transactions;
+        } catch (err) {
+            console.error(`[Gemini] [${modelName}] Error processing chunk ${chunkIndex}:`, {
+                message: err.message,
+                name: err.name,
+                code: err.code
+            });
+            
+            // Retry once for network errors
+            const isNetworkError = err.message?.includes('fetch failed') ||
+                err.message?.includes('ECONNRESET') ||
+                err.message?.includes('ETIMEDOUT') ||
+                err.code === 'ECONNRESET' ||
+                err.code === 'ETIMEDOUT';
+
+            if (isNetworkError) {
+                console.log(`[Gemini] [${modelName}] Retrying chunk ${chunkIndex} after network error...`);
+                await new Promise(resolve => setTimeout(resolve, 5000));
+                
+                try {
+                    const response = await googleAI.models.generateContent({
+                        model: modelName,
+                        contents: conversationHistory,
+                    });
+                    
+                    const candidate = response.candidates?.[0];
+                    const responseText = candidate?.content?.parts?.map(p => p.text ?? "").join("").trim() || "";
+                    
+                    // Log retry response
+                    if (responseText) {
+                        const first200 = responseText.slice(0, 200);
+                        const last200 = responseText.slice(-200);
+                        const bodyPreview = responseText.length > 400
+                            ? `${first200} ... ${last200}`
+                            : responseText;
+                        console.log(`[Gemini] [${modelName}] chunk ${chunkIndex} retry response body:`, bodyPreview);
+                    }
+                    
+                    const { transactions } = parseChunk(responseText);
+                    console.log(`[Gemini] [${modelName}] chunk ${chunkIndex} retry extracted ${transactions.length} transactions`);
+                    return transactions;
+                } catch (retryErr) {
+                    console.error(`[Gemini] [${modelName}] Retry failed for chunk ${chunkIndex}:`, retryErr.message);
+                    throw retryErr;
+                }
+            }
+            
+            throw err;
+        }
+    };
+
+    // Split PDF into chunks
+    const chunks = await splitPdfIntoChunks(buffer, 5);
+    console.log(`[Gemini] Split PDF into ${chunks.length} chunks`);
+
+    // Upload all chunks to Gemini Files API
+    const uploadedChunks = [];
+    for (let i = 0; i < chunks.length; i++) {
+        const chunk = chunks[i];
+        const chunkDisplayName = `${fileDisplayName}_chunk_${i + 1}_pages_${chunk.startPage}-${chunk.endPage}`;
+        
+        try {
+            const { fileName, fileUri } = await uploadPdfChunkToGemini(chunk.buffer, chunkDisplayName, mime);
+            uploadedChunks.push({
+                fileName,
+                fileUri,
+                chunkIndex: i + 1,
+                startPage: chunk.startPage,
+                endPage: chunk.endPage
+            });
+        } catch (uploadErr) {
+            console.error(`[Gemini] Failed to upload chunk ${i + 1}:`, uploadErr.message);
+            // Clean up already uploaded chunks
+            for (const uploaded of uploadedChunks) {
+                try {
+                    await googleAI.files.delete({ name: uploaded.fileName });
+                } catch (deleteErr) {
+                    console.error(`[Gemini] Failed to delete chunk ${uploaded.fileName}:`, deleteErr.message);
+                }
+            }
+            throw uploadErr;
         }
     }
 
-    return transactions || [];
+    console.log(`[Gemini] All ${uploadedChunks.length} chunks uploaded successfully`);
+
+    // Process all chunks and aggregate transactions
+    const allTransactions = [];
+    const seen = new Set();
+    let totalDuplicates = 0;
+
+    try {
+        for (const uploadedChunk of uploadedChunks) {
+            console.log(`[Gemini] Processing chunk ${uploadedChunk.chunkIndex}/${uploadedChunks.length} (pages ${uploadedChunk.startPage}-${uploadedChunk.endPage})`);
+            
+            let chunkTransactions = [];
+            try {
+                chunkTransactions = await processChunkWithGemini(
+                    uploadedChunk.fileUri,
+                    uploadedChunk.chunkIndex,
+                    uploadedChunks.length,
+                    "gemini-2.5-flash"
+                );
+            } catch (err) {
+                console.error(`[Gemini] [gemini-2.5-flash] failed for chunk ${uploadedChunk.chunkIndex}, trying gemini-2.0-flash`);
+                chunkTransactions = await processChunkWithGemini(
+                    uploadedChunk.fileUri,
+                    uploadedChunk.chunkIndex,
+                    uploadedChunks.length,
+                    "gemini-2.0-flash"
+                );
+            }
+
+            // Deduplicate transactions across chunks
+            let addedCount = 0;
+            let chunkDuplicates = 0;
+            
+            for (const txn of chunkTransactions) {
+                const key = JSON.stringify([
+                    txn.date ?? "",
+                    txn.title ?? "",
+                    txn.debit ?? 0,
+                    txn.credit ?? 0,
+                    txn.amount ?? 0,
+                    (txn.note ?? "").slice(0, 100),
+                ]);
+                if (!seen.has(key)) {
+                    seen.add(key);
+                    allTransactions.push(txn);
+                    addedCount++;
+                } else {
+                    chunkDuplicates++;
+                }
+            }
+            
+            if (chunkDuplicates > 0) {
+                console.warn(`[Gemini] Chunk ${uploadedChunk.chunkIndex} had ${chunkDuplicates} duplicates (extracted: ${chunkTransactions.length}, new: ${addedCount})`);
+                totalDuplicates += chunkDuplicates;
+            } else {
+                console.log(`[Gemini] Chunk ${uploadedChunk.chunkIndex} added ${addedCount} new transactions (total: ${allTransactions.length})`);
+            }
+        }
+
+        console.log(`[Gemini] Extraction complete: ${allTransactions.length} total transactions extracted (${totalDuplicates} duplicates filtered)`);
+    } finally {
+        // Clean up all uploaded chunks
+        console.log(`[Gemini] Cleaning up ${uploadedChunks.length} uploaded chunks...`);
+        for (const uploadedChunk of uploadedChunks) {
+            try {
+                await googleAI.files.delete({ name: uploadedChunk.fileName });
+                console.log(`[Gemini] Deleted chunk file: ${uploadedChunk.fileName}`);
+            } catch (deleteErr) {
+                console.error(`[Gemini] Failed to delete chunk ${uploadedChunk.fileName}:`, deleteErr.message);
+            }
+        }
+    }
+
+    return allTransactions || [];
 }
 
 function normalizeTransactions(input) {
@@ -1168,9 +1190,9 @@ async function uploadToGCS(buffer, filename, mime) {
 
     try {
         await file.save(payload, {
-            contentType: mime,
-            resumable: false,
-        });
+        contentType: mime,
+        resumable: false,
+    });
     } catch (err) {
         console.error("[GCS upload] Failed", {
             bucket: TEMP_BUCKET,
@@ -1397,8 +1419,8 @@ app.post("/process", verifyAuth, upload.array("files"), async (req, res) => {
                 console.error("Failed to dispatch background task:", err);
             });
         } else {
-            const taskPayload = {
-                jobRecords,
+        const taskPayload = {
+            jobRecords,
                 files: filesMeta.map(({ name, mime, credits, gcsPath }) => ({ name, mime, credits, gcsPath }))
             };
     
@@ -1407,24 +1429,24 @@ app.post("/process", verifyAuth, upload.array("files"), async (req, res) => {
                 "us-central1",
                 "pdf-jobs-queue"
             );
-    
-            const task = {
-                httpRequest: {
-                    httpMethod: "POST",
-                    url: `https://bankstatement2csv.uc.r.appspot.com/tasks/run/async`,
-                    headers: {
-                        "Content-Type": "application/json",
-                        "Authorization": `Bearer ${bearerToken}`,
-                    },
-                    body: Buffer.from(JSON.stringify(taskPayload)).toString("base64"),
+
+        const task = {
+            httpRequest: {
+                httpMethod: "POST",
+                url: `https://bankstatement2csv.uc.r.appspot.com/tasks/run/async`,
+                headers: {
+                    "Content-Type": "application/json",
+                    "Authorization": `Bearer ${bearerToken}`,
                 },
+                body: Buffer.from(JSON.stringify(taskPayload)).toString("base64"),
+            },
                 dispatchDeadline: { seconds: 1800 }, // 30 minutes (max),
-            };
-    
+        };
+
             await tasksClient.createTask({ parent: queuePath, task });
-    
-            // === Respond immediately ===
-            res.json(jobRecords);
+
+        // === Respond immediately ===
+        res.json(jobRecords);
         }
     } catch (err) {
         console.error("❌ Error:", err);
@@ -1503,7 +1525,7 @@ app.post("/tasks/run/async", async (req, res) => {
                             }
 
                             console.log(`✓ Downloaded ${file.name} (${buffer.length} bytes)`);
-
+                            
                             return {
                                 name: file.name,
                                 mime: file.mime,
