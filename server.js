@@ -1334,7 +1334,7 @@ async function process(encodings, jobRecords, user, adminSupabase) {
     }
 }
 
-const isLocal = true;
+const isLocal = false;
 app.post("/process", verifyAuth, upload.array("files"), async (req, res) => {
     try {
         if (!req.files || !req.files.length) {
